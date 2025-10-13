@@ -1,4 +1,4 @@
-﻿// Licensed to the .NET Foundation under one or more agreements.
+// Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 // See the LICENSE file in the project root for more information.
 
@@ -318,6 +318,14 @@ namespace Microsoft.Crank.Models
         /// Names of additional processes to track.
         /// </summary>
         public List<string> AdditionalProcesses { get; set; } = [];
+
+        /// <summary>
+        /// Optional override for the diagnostics endpoint (Unix domain socket path inside the container) used
+        /// to collect .NET counters from a benchmark application running in a separate Docker container.
+        /// If not set and the job is a Docker job with counters requested, crank will auto-generate a path of the form
+        /// /crank-diag/{RunId}/diag.sock
+        /// </summary>
+        public string ContainerDiagnosticsEndpoint { get; set; }
 
         /// <summary>
         /// Whether to patch the TFM of project references.

@@ -980,7 +980,7 @@ namespace Microsoft.Crank.Agent
                                     {
                                         buildAndRunTask = Task.Run(async () =>
                                         {
-                                            (dockerContainerId, dockerImage, workingDirectory) = await DockerBuildAndRun(tempDir, job, dockerHostname, cancellationToken: cts.Token);
+                                            (dockerContainerId, dockerImage, workingDirectory) = await DockerBuildAndRun(tempDir, job, dockerHostname, context, cts.Token);
                                         });
                                     }
                                     else
@@ -2104,7 +2104,7 @@ namespace Microsoft.Crank.Agent
             }
         }
 
-        private static async Task<(string containerId, string imageName, string workingDirectory)> DockerBuildAndRun(string path, Job job, string hostname, CancellationToken cancellationToken = default(CancellationToken))
+        private static async Task<(string containerId, string imageName, string workingDirectory)> DockerBuildAndRun(string path, Job job, string hostname, JobContext context, CancellationToken cancellationToken = default(CancellationToken))
         {
             // Docker image names must be lowercase
             var imageName = job.GetNormalizedImageName();
@@ -2291,6 +2291,36 @@ namespace Microsoft.Crank.Agent
 
             var environmentArguments = "";
 
+            // Container diagnostics endpoint auto-configuration (must precede environment variable expansion)
+            bool configureContainerDiagnostics = job.IsDocker() && (job.Counters?.Count > 0 || job.CollectCounters || job.Options?.CollectCounters == true);
+            string containerDiagnosticsEndpoint = null;
+            string containerDiagnosticsDir = null;
+            string hostDiagnosticsDir = null;
+            if (configureContainerDiagnostics)
+            {
+                try
+                {
+                    containerDiagnosticsEndpoint = ResolveContainerDiagnosticsEndpoint(job);
+                    if (!string.IsNullOrEmpty(containerDiagnosticsEndpoint))
+                    {
+                        containerDiagnosticsDir = Path.GetDirectoryName(containerDiagnosticsEndpoint);
+                        // Host directory: temp/crank-diag/{RunId}
+                        hostDiagnosticsDir = Path.Combine(Path.GetTempPath(), "crank-diag", job.RunId);
+                        Directory.CreateDirectory(hostDiagnosticsDir);
+
+                        // Add volume mapping and env var (quote paths defensively)
+                        environmentArguments += $"-v \"{hostDiagnosticsDir}:{containerDiagnosticsDir}\" ";
+                        job.EnvironmentVariables["DOTNET_DiagnosticPorts"] = containerDiagnosticsEndpoint + ";connect";
+                        job.EnvironmentVariables["CRANK_CONTAINER_DIAG_ENDPOINT"] = containerDiagnosticsEndpoint;
+                        Log.Info($"[DiagPort] Configured container diagnostics endpoint '{containerDiagnosticsEndpoint}' (host '{hostDiagnosticsDir}' mounted to '{containerDiagnosticsDir}')");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, "[DiagPort] Failed to configure container diagnostics endpoint. Counters will fail to attach.");
+                }
+            }
+
             foreach (var env in job.EnvironmentVariables)
             {
                 Log.Info($"Setting ENV: {env.Key} = {env.Value}");
@@ -2397,6 +2427,14 @@ namespace Microsoft.Crank.Agent
             process.BeginOutputReadLine();
             process.BeginErrorReadLine();
 
+            // Track whether we already started startup diagnostics to avoid duplication after readiness.
+            if (job.CollectStartup)
+            {
+                // For docker we want to capture startup without flipping the job state to Running yet.
+                // Non-docker flow only transitions to Running on readiness or port availability.
+                StartDiagnosticsForRunningJob(job, context, workingDirectory);
+            }
+
             if (!String.IsNullOrEmpty(job.ReadyStateText))
             {
                 Log.Info($"Waiting for startup signal: '{job.ReadyStateText}'...");
@@ -2412,11 +2450,9 @@ namespace Microsoft.Crank.Agent
                         if (job.State == JobState.Starting && e.Data.IndexOf(job.ReadyStateText, StringComparison.OrdinalIgnoreCase) >= 0)
                         {
                             Log.Info($"Ready state detected, application is now running...");
-                            MarkAsRunning(hostname, job, stopwatch);
-
-                            if (job.Collect && !job.CollectStartup)
+                            if (MarkAsRunning(hostname, job, stopwatch) && !job.CollectStartup)
                             {
-                                StartCollection(workingDirectory, job);
+                                StartDiagnosticsForRunningJob(job, context, workingDirectory);
                             }
                         }
 
@@ -2436,11 +2472,9 @@ namespace Microsoft.Crank.Agent
                         if (job.State == JobState.Starting && e.Data.IndexOf(job.ReadyStateText, StringComparison.OrdinalIgnoreCase) >= 0)
                         {
                             Log.Info($"Ready state detected, application is now running...");
-                            MarkAsRunning(hostname, job, stopwatch);
-
-                            if (job.Collect && !job.CollectStartup)
+                            if (MarkAsRunning(hostname, job, stopwatch) && !job.CollectStartup)
                             {
-                                StartCollection(workingDirectory, job);
+                                StartDiagnosticsForRunningJob(job, context, workingDirectory);
                             }
                         }
                     }
@@ -2474,10 +2508,9 @@ namespace Microsoft.Crank.Agent
                 }
 
                 MarkAsRunning(hostname, job, stopwatch);
-
-                if (job.Collect && !job.CollectStartup)
+                if (job.State == JobState.Running && !job.CollectStartup)
                 {
-                    StartCollection(workingDirectory, job);
+                    StartDiagnosticsForRunningJob(job, context, workingDirectory);
                 }
             }
 
@@ -4792,22 +4825,12 @@ namespace Microsoft.Crank.Agent
                 }
             };
 
+            bool startupDiagnosticsStarted = false; // Tracks whether startup-inclusive diagnostics already ran
             if (job.CollectStartup)
             {
-                if (job.Collect || job.Profile && job.ProfileType == Job.PerfViewProfileType)
-                {
-                    StartCollection(Path.Combine(benchmarksRepo, job.BasePath), job);
-                }
-
-                if (job.DotNetTrace || job.Profile && job.ProfileType == Job.DotnetTraceProfileType)
-                {
-                    StartDotNetTrace(job);
-                }
-
-                if (job.Profile && job.ProfileType == Job.UltraProfileType)
-                {
-                    StartUltra(job);
-                }
+                // Start counters & startup-inclusive diagnostics BEFORE marking Running to capture startup period.
+                StartDiagnosticsForRunningJob(job, context, Path.Combine(benchmarksRepo, job.BasePath));
+                startupDiagnosticsStarted = true;
             }
 
             process.Exited += (_, e) =>
@@ -4872,25 +4895,11 @@ namespace Microsoft.Crank.Agent
             {
                 if (MarkAsRunning(hostname, job, stopwatch))
                 {
-                    // Don't wait for the counters to be ready as it could get stuck and block the agent
-                    var _ = StartCountersAsync(job, context);
-
-                    if (!job.CollectStartup)
+                    // Only start diagnostics if they haven't been started yet in the early startup path.
+                    if (!startupDiagnosticsStarted)
                     {
-                        if (job.Collect || job.Profile && job.ProfileType == Job.PerfViewProfileType)
-                        {
-                            StartCollection(Path.Combine(benchmarksRepo, job.BasePath), job);
-                        }
-
-                        if (job.DotNetTrace || job.Profile && job.ProfileType == Job.DotnetTraceProfileType)
-                        {
-                            StartDotNetTrace(job);
-                        }
-
-                        if (job.Profile && job.ProfileType == Job.UltraProfileType)
-                        {
-                            StartUltra(job);
-                        }
+                        StartDiagnosticsForRunningJob(job, context, Path.Combine(benchmarksRepo, job.BasePath));
+                        startupDiagnosticsStarted = true;
                     }
                 }
             }
@@ -4903,11 +4912,75 @@ namespace Microsoft.Crank.Agent
                 throw new ArgumentException($"Undefined process id for '{job.Service}'");
             }
             
-            Log.Info($"Starting counters for process {job.ActiveProcessId}");
+            // Determine if we should use a container diagnostics endpoint instead of PID attach
+            string diagnosticsEndpointPath = null;
+            bool usingContainerEndpoint = false;
+
+            // We attempt endpoint attach only for Docker jobs with counters requested.
+            if (job.IsDocker() && (job.Counters?.Count > 0 || job.CollectCounters || job.Options?.CollectCounters == true))
+            {
+                try
+                {
+                    diagnosticsEndpointPath = ResolveContainerDiagnosticsEndpoint(job);
+                    if (!string.IsNullOrEmpty(diagnosticsEndpointPath))
+                    {
+                        usingContainerEndpoint = true;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, "[DiagPort] Failed to resolve container diagnostics endpoint");
+                }
+            }
+
+            if (usingContainerEndpoint)
+            {
+                Log.Info($"[DiagPort] Starting counters via diagnostics endpoint '{diagnosticsEndpointPath}' (job {job.Service}:{job.Id})");
+            }
+            else
+            {
+                Log.Info($"Starting counters for process {job.ActiveProcessId}");
+            }
 
             var metricsEventSourceSessionId = Guid.NewGuid().ToString();
 
-            var client = new DiagnosticsClient(job.ActiveProcessId);
+            DiagnosticsClient client = null;
+            if (usingContainerEndpoint)
+            {
+                // Wait for the socket to appear (up to timeout) before constructing the client
+                if (!await WaitForSocketAsync(diagnosticsEndpointPath, TimeSpan.FromSeconds(30)))
+                {
+                    var message = $"[DiagPort] Timeout waiting for diagnostics socket '{diagnosticsEndpointPath}'. Failing job.";
+                    Log.Error(message);
+                    job.Error = message;
+                    job.State = JobState.Failed;
+                    return;
+                }
+
+                try
+                {
+                    // Attempt to create a DiagnosticsClient from a Unix domain socket/endpoint path.
+                    // Newer versions expose a constructor or factory for this. We attempt a best-effort dynamic invocation
+                    // while still preferring a direct constructor if available.
+                    client = TryCreateClientFromEndpoint(diagnosticsEndpointPath);
+                    if (client == null)
+                    {
+                        throw new InvalidOperationException("Endpoint-based DiagnosticsClient creation not supported by the current package version.");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    var message = $"[DiagPort] Failed to create DiagnosticsClient for endpoint '{diagnosticsEndpointPath}': {ex.Message}";
+                    Log.Error(ex, message);
+                    job.Error = message;
+                    job.State = JobState.Failed;
+                    return;
+                }
+            }
+            else
+            {
+                client = new DiagnosticsClient(job.ActiveProcessId);
+            }
 
             var providerNames = job.Counters.Select(x => x.Provider).Distinct().ToArray();
 
@@ -5011,6 +5084,45 @@ namespace Microsoft.Crank.Agent
             context.CountersCompletionSource = new TaskCompletionSource<bool>();
 
             Log.Info("Event pipe session started");
+            if (usingContainerEndpoint)
+            {
+                // Record attach mode metadata for later analysis
+                job.Metadata.Enqueue(new MeasurementMetadata
+                {
+                    Source = "Agent",
+                    Name = "CounterAttachMode",
+                    Aggregate = Operation.Last,
+                    Reduce = Operation.Last,
+                    ShortDescription = "Counter attach mode (Pid|Endpoint)",
+                    LongDescription = "Indicates how counters were attached: directly to PID or via diagnostics endpoint.",
+                    Format = "g"
+                });
+                job.Measurements.Enqueue(new Measurement
+                {
+                    Name = "CounterAttachMode",
+                    Timestamp = DateTime.UtcNow,
+                    Value = "Endpoint"
+                });
+            }
+            else
+            {
+                job.Metadata.Enqueue(new MeasurementMetadata
+                {
+                    Source = "Agent",
+                    Name = "CounterAttachMode",
+                    Aggregate = Operation.Last,
+                    Reduce = Operation.Last,
+                    ShortDescription = "Counter attach mode (Pid|Endpoint)",
+                    LongDescription = "Indicates how counters were attached: directly to PID or via diagnostics endpoint.",
+                    Format = "g"
+                });
+                job.Measurements.Enqueue(new Measurement
+                {
+                    Name = "CounterAttachMode",
+                    Timestamp = DateTime.UtcNow,
+                    Value = "Pid"
+                });
+            }
 
             // Run asynchronously so it doesn't block the agent
             var streamTask = Task.Run(() =>
@@ -5225,6 +5337,182 @@ namespace Microsoft.Crank.Agent
             context.EventPipeSession = null;
 
             Log.Info($"Event pipes terminated ({job.Service}:{job.Id})");
+
+            // Cleanup diagnostics directory if we auto-created it and NoClean is false
+            if (usingContainerEndpoint && !job.NoClean)
+            {
+                try
+                {
+                    var endpoint = ResolveContainerDiagnosticsEndpoint(job);
+                    if (!string.IsNullOrEmpty(endpoint))
+                    {
+                        var dir = Path.GetDirectoryName(endpoint);
+                        var hostDir = Path.Combine(Path.GetTempPath(), "crank-diag", job.RunId);
+                        if (Directory.Exists(hostDir))
+                        {
+                            Directory.Delete(hostDir, recursive: true);
+                            Log.Info($"[DiagPort] Deleted host diagnostics directory '{hostDir}'");
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log.Warning($"[DiagPort] Failed to cleanup diagnostics directory: {ex.Message}");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Starts counters and any other requested diagnostics (collection, dotnet-trace, ultra).
+        /// This unified method no longer distinguishes startup vs. post-start phases; the caller
+        /// simply invokes it once at the appropriate time (or earlier for CollectStartup).
+        /// </summary>
+        private static void StartDiagnosticsForRunningJob(Job job, JobContext context, string workingDirectory)
+        {
+            // If counters already active, assume diagnostics initialized.
+            if (context?.EventPipeSession != null)
+            {
+                Log.Info("Diagnostics already active (EventPipeSession present); skipping duplicate StartDiagnosticsForRunningJob invocation.");
+                return;
+            }
+
+            if (job.Counters?.Count > 0 || job.CollectCounters || job.Options?.CollectCounters == true)
+            {
+                _ = StartCountersAsync(job, context);
+            }
+
+            if (job.Collect || (job.Profile && job.ProfileType == Job.PerfViewProfileType))
+            {
+                StartCollection(workingDirectory, job);
+            }
+            if (job.DotNetTrace || (job.Profile && job.ProfileType == Job.DotnetTraceProfileType))
+            {
+                StartDotNetTrace(job);
+            }
+            if (job.Profile && job.ProfileType == Job.UltraProfileType)
+            {
+                StartUltra(job);
+            }
+        }
+
+        /// <summary>
+        /// Attempts to create a DiagnosticsClient from an endpoint path. This method first looks for a public
+        /// constructor accepting a single string (path). If not found, it attempts to discover a factory method
+        /// via reflection. Returns null if no supported API exists.
+        /// </summary>
+        private static DiagnosticsClient TryCreateClientFromEndpoint(string endpointPath)
+        {
+            try
+            {
+                var ctor = typeof(DiagnosticsClient).GetConstructor(new[] { typeof(string) });
+                if (ctor != null)
+                {
+                    return (DiagnosticsClient)ctor.Invoke(new object[] { endpointPath });
+                }
+
+                var candidateFactory = typeof(DiagnosticsClient).GetMethods(BindingFlags.Public | BindingFlags.Static)
+                    .FirstOrDefault(m => m.ReturnType == typeof(DiagnosticsClient)
+                        && m.GetParameters().Length == 1
+                        && m.GetParameters()[0].ParameterType == typeof(string)
+                        && (m.Name.Contains("Endpoint", StringComparison.OrdinalIgnoreCase) || m.Name.StartsWith("Create", StringComparison.OrdinalIgnoreCase)));
+                if (candidateFactory != null)
+                {
+                    return (DiagnosticsClient)candidateFactory.Invoke(null, new object[] { endpointPath });
+                }
+
+                var assembly = typeof(DiagnosticsClient).Assembly;
+                var connectorType = assembly.GetType("Microsoft.Diagnostics.NETCore.Client.DiagnosticsClientConnector", throwOnError: false);
+                if (connectorType != null)
+                {
+                    var connector = Activator.CreateInstance(connectorType);
+                    var connectMethod = connectorType.GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                        .FirstOrDefault(m => m.Name.StartsWith("Connect", StringComparison.OrdinalIgnoreCase)
+                                             && m.GetParameters().Length >= 1
+                                             && m.GetParameters()[0].ParameterType == typeof(string));
+                    if (connectMethod != null)
+                    {
+                        var task = connectMethod.Invoke(connector, new object[] { endpointPath });
+                        if (task is Task t)
+                        {
+                            t.GetAwaiter().GetResult();
+                            var taskType = t.GetType();
+                            if (taskType.IsGenericType)
+                            {
+                                var resultProp = taskType.GetProperty("Result");
+                                var resultVal = resultProp?.GetValue(t);
+                                if (resultVal is DiagnosticsClient dc)
+                                {
+                                    return dc;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Warning($"[DiagPort] Reflection-based DiagnosticsClient endpoint attach failed: {ex.Message}");
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Resolves the container diagnostics endpoint path. If the user provided an override via
+        /// job.ContainerDiagnosticsEndpoint it is used (with auto filename if directory). Otherwise
+        /// an auto-generated socket path under /crank-diag/{RunId}/diag.sock is returned.
+        /// This path is the in-container path. Creation of the host mounted directory occurs earlier
+        /// in the docker run setup phase.
+        /// </summary>
+        private static string ResolveContainerDiagnosticsEndpoint(Job job)
+        {
+            // Only generate if counters are requested
+            if (!(job.Counters?.Count > 0 || job.CollectCounters || job.Options?.CollectCounters == true))
+            {
+                return null;
+            }
+            var endpoint = job.ContainerDiagnosticsEndpoint;
+            var runId = !string.IsNullOrEmpty(job.RunId) ? job.RunId : job.Id.ToString();
+            if (string.IsNullOrWhiteSpace(endpoint))
+            {
+                return $"/crank-diag/{runId}/diag.sock";
+            }
+            if (endpoint.EndsWith("/") || endpoint.EndsWith("\\"))
+            {
+                return endpoint.TrimEnd('/', '\\') + $"/crank_{runId}.sock";
+            }
+            return endpoint;
+        }
+
+        private static async Task<bool> WaitForSocketAsync(string path, TimeSpan timeout)
+        {
+            if (string.IsNullOrEmpty(path)) return false;
+            var start = DateTime.UtcNow;
+            var logged = false;
+            var pollDelay = TimeSpan.FromMilliseconds(100);
+            while (DateTime.UtcNow - start < timeout)
+            {
+                try
+                {
+                    if (File.Exists(path))
+                    {
+                        return true;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    if (!logged)
+                    {
+                        Log.Warning($"[DiagPort] Exception while waiting for socket '{path}': {ex.Message}");
+                        logged = true;
+                    }
+                }
+                await Task.Delay(pollDelay);
+                if ((DateTime.UtcNow - start).TotalSeconds > 2 && pollDelay < TimeSpan.FromMilliseconds(500))
+                {
+                    pollDelay = TimeSpan.FromMilliseconds(500);
+                }
+            }
+            return false;
         }
 
         private static void StartCollection(string workingDirectory, Job job)
