@@ -5,13 +5,13 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Formats.Tar;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Net.Http;
 using System.Runtime.InteropServices;
 using System.Text.Json;
-using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -20,38 +20,43 @@ namespace Microsoft.Crank.Agent
     /// <summary>
     /// Lightweight client for the Build Caching Service (BCS) in dotnet-performance-infra.
     /// Downloads pre-built runtime artifacts from public Azure Blob Storage and overlays
-    /// them into a standard dotnet installation directory.
+    /// them onto the agent's installed shared framework and/or the published app output so
+    /// benchmarks run against the BCS runtime instead of the feed-installed one.
     /// </summary>
     internal static class BuildCacheClient
     {
-        private static readonly HttpClient _httpClient = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
-
-        // Cache latestBuilds.json responses to avoid repeated downloads (keyed by baseUrl+branch)
-        private static readonly ConcurrentDictionary<string, (DateTimeOffset fetchedAt, LatestBuildsResponse data)> _latestBuildsCache = new();
+        private const int DownloadRetryCount = 3;
+        private static readonly TimeSpan _httpTimeout = TimeSpan.FromMinutes(10);
         private static readonly TimeSpan _latestBuildsCacheDuration = TimeSpan.FromHours(1);
 
-        // Cache of already-installed BCS commit SHAs to avoid re-extracting
-        private static readonly ConcurrentDictionary<string, byte> _installedBuildCacheRuntimes = new(StringComparer.OrdinalIgnoreCase);
+        private static readonly HttpClient _httpClient = new HttpClient { Timeout = _httpTimeout };
+
+        // Cache latestBuilds.json responses to avoid repeated downloads (keyed by baseUrl|repo|branch).
+        private static readonly ConcurrentDictionary<string, (DateTimeOffset fetchedAt, LatestBuildsResponse data)> _latestBuildsCache = new();
+
+        // Per-(commit,config) async locks so concurrent jobs serialize their downloads/extracts.
+        private static readonly ConcurrentDictionary<string, SemaphoreSlim> _extractLocks = new();
 
         /// <summary>
         /// Maps the agent's platform (RID) to the BCS configuration key and artifact filename.
         /// </summary>
-        private static readonly Dictionary<string, (string configKey, string artifactFile)> _platformToBcsConfig = new(StringComparer.OrdinalIgnoreCase)
-        {
-            ["linux-x64"] = ("coreclr_x64_linux", "BuildArtifacts_linux_x64_Release_coreclr.tar.gz"),
-            ["linux-arm64"] = ("coreclr_arm64_linux", "BuildArtifacts_linux_arm64_Release_coreclr.tar.gz"),
-            ["linux-musl-x64"] = ("coreclr_muslx64_linux", "BuildArtifacts_linux_musl_x64_Release_coreclr.tar.gz"),
-            ["win-x64"] = ("coreclr_x64_windows", "BuildArtifacts_windows_x64_Release_coreclr.zip"),
-            ["win-arm64"] = ("coreclr_arm64_windows", "BuildArtifacts_windows_arm64_Release_coreclr.zip"),
-            ["win-x86"] = ("coreclr_x86_windows", "BuildArtifacts_windows_x86_Release_coreclr.zip"),
-        };
+        internal static readonly IReadOnlyDictionary<string, (string configKey, string artifactFile)> PlatformToBcsConfig =
+            new Dictionary<string, (string configKey, string artifactFile)>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["linux-x64"] = ("coreclr_x64_linux", "BuildArtifacts_linux_x64_Release_coreclr.tar.gz"),
+                ["linux-arm64"] = ("coreclr_arm64_linux", "BuildArtifacts_linux_arm64_Release_coreclr.tar.gz"),
+                ["linux-musl-x64"] = ("coreclr_muslx64_linux", "BuildArtifacts_linux_musl_x64_Release_coreclr.tar.gz"),
+                ["win-x64"] = ("coreclr_x64_windows", "BuildArtifacts_windows_x64_Release_coreclr.zip"),
+                ["win-arm64"] = ("coreclr_arm64_windows", "BuildArtifacts_windows_arm64_Release_coreclr.zip"),
+                ["win-x86"] = ("coreclr_x86_windows", "BuildArtifacts_windows_x86_Release_coreclr.zip"),
+            };
 
         /// <summary>
-        /// Resolves the commit SHA to use from BCS. If a specific commit is provided, validates
-        /// it exists. Otherwise queries latestBuilds.json for the latest commit on the branch.
-        /// Returns the commit SHA and the runtime version string.
+        /// Resolves the commit SHA to use from BCS. If a specific commit is provided, returns it
+        /// (after platform-config inference). Otherwise queries latestBuilds.json for the latest
+        /// commit on the branch.
         /// </summary>
-        public static async Task<(string commitSha, string runtimeVersion)> ResolveCommitAsync(
+        public static async Task<(string commitSha, string buildCacheConfig)> ResolveCommitAsync(
             string baseUrl,
             string repoName,
             string branch,
@@ -59,525 +64,197 @@ namespace Microsoft.Crank.Agent
             string buildCacheConfig,
             CancellationToken cancellationToken = default)
         {
-            var platformMoniker = GetPlatformMoniker();
-
-            if (!string.IsNullOrEmpty(buildCacheConfig))
-            {
-                // Use explicit config key
-            }
-            else if (_platformToBcsConfig.TryGetValue(platformMoniker, out var mapped))
-            {
-                buildCacheConfig = mapped.configKey;
-            }
-            else
-            {
-                throw new InvalidOperationException($"No Build Cache configuration mapping for platform '{platformMoniker}'. Specify buildCacheConfig explicitly.");
-            }
+            buildCacheConfig = ResolveBuildCacheConfig(buildCacheConfig);
 
             if (string.IsNullOrEmpty(commitSha))
             {
-                // Query latestBuilds.json for the latest commit
                 var latestBuilds = await GetLatestBuildsAsync(baseUrl, repoName, branch, cancellationToken);
 
-                // Try to get the config-specific entry, fall back to "all"
                 if (latestBuilds.Entries.TryGetValue(buildCacheConfig, out var configEntry) && !string.IsNullOrEmpty(configEntry.CommitSha))
                 {
                     commitSha = configEntry.CommitSha;
-                    Log.Info($"Build Cache: Using latest commit {commitSha.Substring(0, Math.Min(8, commitSha.Length))} for config '{buildCacheConfig}' on branch '{branch}' (committed {configEntry.CommitTime})");
+                    Log.Info($"Build Cache: Using latest commit {ShortSha(commitSha)} for config '{buildCacheConfig}' on branch '{branch}' (committed {configEntry.CommitTime})");
                 }
                 else if (latestBuilds.Entries.TryGetValue("all", out var allEntry) && !string.IsNullOrEmpty(allEntry.CommitSha))
                 {
                     commitSha = allEntry.CommitSha;
-                    Log.Info($"Build Cache: Using latest commit {commitSha.Substring(0, Math.Min(8, commitSha.Length))} for all configs on branch '{branch}' (committed {allEntry.CommitTime})");
+                    Log.Info($"Build Cache: Using latest commit {ShortSha(commitSha)} for all configs on branch '{branch}' (committed {allEntry.CommitTime})");
                 }
                 else
                 {
-                    throw new InvalidOperationException($"Build Cache: No latest build found for branch '{branch}'. Check that BCS has builds for this branch.");
+                    throw new InvalidOperationException(
+                        $"Build Cache: No latest build found for branch '{branch}' (config '{buildCacheConfig}'). Check that BCS has builds for this branch.");
                 }
             }
             else
             {
-                Log.Info($"Build Cache: Using specified commit {commitSha.Substring(0, Math.Min(8, commitSha.Length))}");
+                Log.Info($"Build Cache: Using specified commit {ShortSha(commitSha)}");
             }
 
-            // Try to determine a runtime version from the commit. For now, we return a placeholder
-            // that will be replaced after extraction by reading .version from the shared framework.
-            var runtimeVersion = $"buildcache-{commitSha.Substring(0, Math.Min(12, commitSha.Length))}";
-
-            return (commitSha, runtimeVersion);
+            return (commitSha, buildCacheConfig);
         }
 
         /// <summary>
-        /// Downloads and extracts BCS runtime artifacts to a temp directory without overlaying.
-        /// Returns the path to the extracted directory for later overlay into published output.
+        /// Downloads and extracts BCS runtime artifacts to a per-job temp directory. The caller
+        /// is responsible for invoking the overlay methods on the returned directory.
         /// </summary>
         public static async Task<string> DownloadAndExtractAsync(
             string baseUrl,
             string repoName,
             string commitSha,
             string buildCacheConfig,
-            string targetFramework,
             CancellationToken cancellationToken = default)
         {
-            var platformMoniker = GetPlatformMoniker();
-
-            if (string.IsNullOrEmpty(buildCacheConfig))
+            if (string.IsNullOrEmpty(commitSha))
             {
-                if (_platformToBcsConfig.TryGetValue(platformMoniker, out var mapped))
+                throw new ArgumentException("commitSha must be provided.", nameof(commitSha));
+            }
+
+            buildCacheConfig = ResolveBuildCacheConfig(buildCacheConfig);
+            var artifactFile = GetArtifactFile(buildCacheConfig);
+            var normalizedBaseUrl = (baseUrl ?? string.Empty).TrimEnd('/');
+
+            var artifactUrl =
+                $"{normalizedBaseUrl}/builds/{Uri.EscapeDataString(repoName)}/buildArtifacts/" +
+                $"{Uri.EscapeDataString(commitSha)}/{Uri.EscapeDataString(buildCacheConfig)}/{Uri.EscapeDataString(artifactFile)}";
+
+            var rootCacheDir = Path.Combine(Path.GetTempPath(), "crank-buildcache");
+            Directory.CreateDirectory(rootCacheDir);
+
+            var safeConfig = SanitizeForPath(buildCacheConfig);
+
+            // Per-(commit,config) lock so two concurrent jobs don't race on the same directory.
+            var lockKey = $"{commitSha}|{safeConfig}";
+            var gate = _extractLocks.GetOrAdd(lockKey, _ => new SemaphoreSlim(1, 1));
+            await gate.WaitAsync(cancellationToken);
+            try
+            {
+                var commitDir = Path.Combine(rootCacheDir, commitSha);
+                Directory.CreateDirectory(commitDir);
+
+                var archivePath = Path.Combine(commitDir, $"{safeConfig}-{artifactFile}");
+
+                if (!File.Exists(archivePath))
                 {
-                    buildCacheConfig = mapped.configKey;
+                    Log.Info($"Build Cache: Downloading {artifactFile} from {artifactUrl}");
+                    await DownloadWithRetryAsync(artifactUrl, archivePath, cancellationToken);
+                    Log.Info($"Build Cache: Downloaded {new FileInfo(archivePath).Length / (1024 * 1024)} MB");
                 }
                 else
                 {
-                    throw new InvalidOperationException($"No Build Cache configuration mapping for platform '{platformMoniker}'.");
-                }
-            }
-
-            string artifactFile;
-            if (_platformToBcsConfig.Values.Any(v => v.configKey == buildCacheConfig))
-            {
-                artifactFile = _platformToBcsConfig.Values.First(v => v.configKey == buildCacheConfig).artifactFile;
-            }
-            else
-            {
-                throw new InvalidOperationException($"Unknown Build Cache configuration key: '{buildCacheConfig}'.");
-            }
-
-            var artifactUrl = $"{baseUrl}/builds/{repoName}/buildArtifacts/{commitSha}/{buildCacheConfig}/{artifactFile}";
-
-            Log.Info($"Build Cache: Downloading {artifactFile} from {artifactUrl}");
-
-            var tempDir = Path.Combine(Path.GetTempPath(), "crank-buildcache", commitSha);
-            Directory.CreateDirectory(tempDir);
-            var tempArchive = Path.Combine(tempDir, artifactFile);
-
-            if (!File.Exists(tempArchive))
-            {
-                using var response = await _httpClient.GetAsync(artifactUrl, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
-
-                if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
-                {
-                    throw new InvalidOperationException($"Build Cache: Artifact not found for commit {commitSha} with config '{buildCacheConfig}'.");
+                    Log.Info($"Build Cache: Using cached archive at {archivePath}");
                 }
 
-                response.EnsureSuccessStatusCode();
+                var extractDir = Path.Combine(commitDir, $"extracted-{safeConfig}-{Guid.NewGuid():N}");
+                Directory.CreateDirectory(extractDir);
 
-                using var fileStream = File.Create(tempArchive);
-                await response.Content.CopyToAsync(fileStream, cancellationToken);
+                Log.Info($"Build Cache: Extracting archive to {extractDir} ...");
+                await ExtractArchiveAsync(archivePath, extractDir, cancellationToken);
 
-                Log.Info($"Build Cache: Downloaded {new FileInfo(tempArchive).Length / (1024 * 1024)} MB");
+                return extractDir;
             }
-            else
+            finally
             {
-                Log.Info($"Build Cache: Using cached archive at {tempArchive}");
+                gate.Release();
             }
-
-            var extractDir = Path.Combine(tempDir, $"extracted-{buildCacheConfig}");
-            if (Directory.Exists(extractDir))
-            {
-                Directory.Delete(extractDir, true);
-            }
-
-            Log.Info($"Build Cache: Extracting archive...");
-
-            if (artifactFile.EndsWith(".tar.gz", StringComparison.OrdinalIgnoreCase))
-            {
-                await ExtractTarGzAsync(tempArchive, extractDir, cancellationToken);
-            }
-            else if (artifactFile.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
-            {
-                ZipFile.ExtractToDirectory(tempArchive, extractDir);
-            }
-            else
-            {
-                throw new InvalidOperationException($"Unsupported archive format: {artifactFile}");
-            }
-
-            return extractDir;
         }
 
         /// <summary>
-        /// Overlays BCS runtime binaries (managed + native) into a published output directory,
-        /// replacing NuGet-sourced runtime DLLs with BCS-built ones.
-        /// Returns the number of files overlaid.
+        /// Overlays BCS runtime binaries (managed + native + host binaries) into a published
+        /// output directory. Used for self-contained publishes where the runtime is bundled in
+        /// the publish output.
         /// </summary>
+        /// <returns>Number of files overlaid.</returns>
         public static int OverlayPublishedOutput(string extractDir, string outputFolder)
         {
-            var platformMoniker = GetPlatformMoniker();
+            var rid = GetPlatformMoniker();
             int filesCopied = 0;
 
-            // Find the NuGet package directory for managed + native DLLs
-            var nugetPackageDir = FindDirectory(extractDir, $"microsoft.netcore.app.runtime.{platformMoniker}");
-
+            var nugetPackageDir = FindDirectory(extractDir, $"microsoft.netcore.app.runtime.{rid}");
             if (nugetPackageDir != null)
             {
-                var runtimesDir = Path.Combine(nugetPackageDir, "Release", "runtimes", platformMoniker);
-
+                var runtimesDir = Path.Combine(nugetPackageDir, "Release", "runtimes", rid);
                 if (Directory.Exists(runtimesDir))
                 {
-                    // Copy managed DLLs from lib/net{X}.0/
-                    var libDir = Path.Combine(runtimesDir, "lib");
-                    if (Directory.Exists(libDir))
-                    {
-                        var managedDir = Directory.GetDirectories(libDir).FirstOrDefault();
-                        if (managedDir != null)
-                        {
-                            foreach (var file in Directory.GetFiles(managedDir, "*.dll"))
-                            {
-                                var destFile = Path.Combine(outputFolder, Path.GetFileName(file));
-                                if (File.Exists(destFile))
-                                {
-                                    File.Copy(file, destFile, overwrite: true);
-                                    filesCopied++;
-                                }
-                            }
-                        }
-                    }
-
-                    // Copy native libraries from native/
-                    var nativeDir = Path.Combine(runtimesDir, "native");
-                    if (Directory.Exists(nativeDir))
-                    {
-                        foreach (var file in Directory.GetFiles(nativeDir))
-                        {
-                            var fileName = Path.GetFileName(file);
-                            if (fileName.EndsWith(".pdb", StringComparison.OrdinalIgnoreCase) ||
-                                fileName.EndsWith(".dbg", StringComparison.OrdinalIgnoreCase))
-                            {
-                                continue;
-                            }
-
-                            var destFile = Path.Combine(outputFolder, fileName);
-                            if (File.Exists(destFile))
-                            {
-                                File.Copy(file, destFile, overwrite: true);
-                                filesCopied++;
-                            }
-                        }
-                    }
+                    filesCopied += CopyManaged(runtimesDir, outputFolder);
+                    filesCopied += CopyNative(runtimesDir, outputFolder);
                 }
             }
 
-            // Also overlay host binaries from {rid}.Release/corehost/
-            var corehostDir = FindCorehostDirectory(extractDir, platformMoniker);
+            var corehostDir = FindCorehostDirectory(extractDir, rid);
             if (corehostDir != null)
             {
-                var hostPolicyName = GetNativeLibName("hostpolicy");
-                var hostPolicySrc = Path.Combine(corehostDir, hostPolicyName);
-                var hostPolicyDest = Path.Combine(outputFolder, hostPolicyName);
-                if (File.Exists(hostPolicySrc) && File.Exists(hostPolicyDest))
-                {
-                    File.Copy(hostPolicySrc, hostPolicyDest, overwrite: true);
-                    filesCopied++;
-                }
+                // For self-contained, all three host binaries live alongside the app.
+                filesCopied += CopyHostBinaryIfPresent(corehostDir, outputFolder, GetNativeLibName("hostpolicy"));
+                filesCopied += CopyHostBinaryIfPresent(corehostDir, outputFolder, GetNativeLibName("hostfxr"));
+                filesCopied += CopyHostBinaryIfPresent(corehostDir, outputFolder, GetDotnetExecutableName());
             }
 
             return filesCopied;
         }
 
         /// <summary>
-        /// Downloads and extracts BCS runtime artifacts into a standard dotnet installation directory.
-        /// Overlays runtime binaries on top of an existing dotnet-install layout.
-        /// Returns the actual runtime version string read from the extracted artifacts.
+        /// Overlays BCS runtime binaries into the agent's installed dotnet home so framework-
+        /// dependent apps that load the runtime from <c>shared/Microsoft.NETCore.App/{version}/</c>
+        /// get the BCS bits at runtime.
         /// </summary>
-        public static async Task<string> InstallRuntimeFromBuildCacheAsync(
-            string baseUrl,
-            string repoName,
-            string commitSha,
-            string buildCacheConfig,
-            string dotnetHome,
-            string targetFramework,
-            CancellationToken cancellationToken = default)
+        /// <returns>Number of files overlaid.</returns>
+        public static int OverlayDotnetHome(string extractDir, string dotnetHome, string runtimeVersion)
         {
-            if (_installedBuildCacheRuntimes.ContainsKey(commitSha))
+            if (string.IsNullOrEmpty(runtimeVersion))
             {
-                Log.Info($"Build Cache: Runtime for commit {commitSha.Substring(0, Math.Min(8, commitSha.Length))} already installed, skipping.");
-
-                // Read the version from the already-installed runtime
-                return ReadInstalledBuildCacheVersion(dotnetHome, targetFramework) ?? $"buildcache-{commitSha.Substring(0, 12)}";
+                throw new ArgumentException("runtimeVersion must be provided.", nameof(runtimeVersion));
             }
 
-            var platformMoniker = GetPlatformMoniker();
+            var rid = GetPlatformMoniker();
+            int filesCopied = 0;
 
-            if (string.IsNullOrEmpty(buildCacheConfig))
+            var sharedFrameworkDir = Path.Combine(dotnetHome, "shared", "Microsoft.NETCore.App", runtimeVersion);
+            if (!Directory.Exists(sharedFrameworkDir))
             {
-                if (_platformToBcsConfig.TryGetValue(platformMoniker, out var mapped))
-                {
-                    buildCacheConfig = mapped.configKey;
-                }
-                else
-                {
-                    throw new InvalidOperationException($"No Build Cache configuration mapping for platform '{platformMoniker}'.");
-                }
+                throw new InvalidOperationException(
+                    $"Build Cache: Expected shared framework directory does not exist: '{sharedFrameworkDir}'. " +
+                    "The feed-resolved runtime must be installed before overlaying.");
             }
 
-            // Determine artifact filename
-            string artifactFile;
-            if (_platformToBcsConfig.Values.Any(v => v.configKey == buildCacheConfig))
-            {
-                artifactFile = _platformToBcsConfig.Values.First(v => v.configKey == buildCacheConfig).artifactFile;
-            }
-            else
-            {
-                throw new InvalidOperationException($"Unknown Build Cache configuration key: '{buildCacheConfig}'.");
-            }
-
-            // Construct the download URL
-            var artifactUrl = $"{baseUrl}/builds/{repoName}/buildArtifacts/{commitSha}/{buildCacheConfig}/{artifactFile}";
-
-            Log.Info($"Build Cache: Downloading {artifactFile} from {artifactUrl}");
-
-            // Download to a temp file
-            var tempDir = Path.Combine(Path.GetTempPath(), "crank-buildcache", commitSha);
-            Directory.CreateDirectory(tempDir);
-            var tempArchive = Path.Combine(tempDir, artifactFile);
-
-            try
-            {
-                if (!File.Exists(tempArchive))
-                {
-                    using var response = await _httpClient.GetAsync(artifactUrl, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
-
-                    if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
-                    {
-                        throw new InvalidOperationException($"Build Cache: Artifact not found for commit {commitSha} with config '{buildCacheConfig}'. The build may not exist in the cache.");
-                    }
-
-                    response.EnsureSuccessStatusCode();
-
-                    using var fileStream = File.Create(tempArchive);
-                    await response.Content.CopyToAsync(fileStream, cancellationToken);
-
-                    Log.Info($"Build Cache: Downloaded {new FileInfo(tempArchive).Length / (1024 * 1024)} MB");
-                }
-                else
-                {
-                    Log.Info($"Build Cache: Using cached archive at {tempArchive}");
-                }
-
-                // Extract and overlay
-                var extractDir = Path.Combine(tempDir, "extracted");
-                if (Directory.Exists(extractDir))
-                {
-                    Directory.Delete(extractDir, true);
-                }
-
-                Log.Info($"Build Cache: Extracting archive...");
-
-                if (artifactFile.EndsWith(".tar.gz", StringComparison.OrdinalIgnoreCase))
-                {
-                    await ExtractTarGzAsync(tempArchive, extractDir, cancellationToken);
-                }
-                else if (artifactFile.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
-                {
-                    ZipFile.ExtractToDirectory(tempArchive, extractDir);
-                }
-                else
-                {
-                    throw new InvalidOperationException($"Unsupported archive format: {artifactFile}");
-                }
-
-                // Overlay into dotnet home
-                var runtimeVersion = await OverlayRuntimeAsync(extractDir, dotnetHome, platformMoniker, targetFramework, commitSha, cancellationToken);
-
-                _installedBuildCacheRuntimes.TryAdd(commitSha, 0);
-
-                Log.Info($"Build Cache: Runtime {runtimeVersion} (commit {commitSha.Substring(0, Math.Min(8, commitSha.Length))}) installed successfully.");
-
-                return runtimeVersion;
-            }
-            catch (Exception ex) when (ex is not InvalidOperationException)
-            {
-                throw new InvalidOperationException($"Build Cache: Failed to install runtime from commit {commitSha}: {ex.Message}", ex);
-            }
-        }
-
-        /// <summary>
-        /// Overlays extracted BCS artifacts into the dotnet home directory structure.
-        /// </summary>
-        private static async Task<string> OverlayRuntimeAsync(
-            string extractDir,
-            string dotnetHome,
-            string platformMoniker,
-            string targetFramework,
-            string commitSha,
-            CancellationToken cancellationToken)
-        {
-            var versionPrefix = ExtractVersionPrefix(targetFramework);
-            var rid = platformMoniker;
-
-            // The NuGet package layout inside the archive is at:
-            // microsoft.netcore.app.runtime.{rid}/Release/runtimes/{rid}/
-            //   lib/net{X}.0/  → managed DLLs
-            //   native/        → native libraries
             var nugetPackageDir = FindDirectory(extractDir, $"microsoft.netcore.app.runtime.{rid}");
-            string managedDir = null;
-            string nativeDir = null;
-
             if (nugetPackageDir != null)
             {
                 var runtimesDir = Path.Combine(nugetPackageDir, "Release", "runtimes", rid);
-
                 if (Directory.Exists(runtimesDir))
                 {
-                    // Find the lib/net{X}.0 directory
-                    var libDir = Path.Combine(runtimesDir, "lib");
-                    if (Directory.Exists(libDir))
-                    {
-                        managedDir = Directory.GetDirectories(libDir)
-                            .FirstOrDefault(d => Path.GetFileName(d).StartsWith($"net{versionPrefix}", StringComparison.OrdinalIgnoreCase))
-                            ?? Directory.GetDirectories(libDir).FirstOrDefault();
-                    }
-
-                    nativeDir = Path.Combine(runtimesDir, "native");
-                    if (!Directory.Exists(nativeDir))
-                    {
-                        nativeDir = null;
-                    }
+                    filesCopied += CopyManaged(runtimesDir, sharedFrameworkDir);
+                    filesCopied += CopyNative(runtimesDir, sharedFrameworkDir);
                 }
             }
 
-            // Determine the runtime version from the managed DLLs directory or other metadata
-            var runtimeVersion = DetermineRuntimeVersion(extractDir, versionPrefix, commitSha);
-
-            // Create the shared framework directory
-            var sharedFrameworkDir = Path.Combine(dotnetHome, "shared", "Microsoft.NETCore.App", runtimeVersion);
-            Directory.CreateDirectory(sharedFrameworkDir);
-
-            int filesCopied = 0;
-
-            // Copy managed DLLs
-            if (managedDir != null && Directory.Exists(managedDir))
-            {
-                foreach (var file in Directory.GetFiles(managedDir, "*.dll"))
-                {
-                    File.Copy(file, Path.Combine(sharedFrameworkDir, Path.GetFileName(file)), overwrite: true);
-                    filesCopied++;
-                }
-
-                Log.Info($"Build Cache: Copied {filesCopied} managed assemblies to shared framework.");
-            }
-
-            // Copy native libraries
-            if (nativeDir != null && Directory.Exists(nativeDir))
-            {
-                int nativeCount = 0;
-
-                foreach (var file in Directory.GetFiles(nativeDir))
-                {
-                    var fileName = Path.GetFileName(file);
-
-                    // Skip debug symbols during overlay (keep it lean)
-                    if (fileName.EndsWith(".dbg", StringComparison.OrdinalIgnoreCase) ||
-                        fileName.EndsWith(".pdb", StringComparison.OrdinalIgnoreCase))
-                    {
-                        continue;
-                    }
-
-                    File.Copy(file, Path.Combine(sharedFrameworkDir, fileName), overwrite: true);
-                    nativeCount++;
-                }
-
-                Log.Info($"Build Cache: Copied {nativeCount} native libraries to shared framework.");
-                filesCopied += nativeCount;
-            }
-
-            // Also look for host binaries in the corehost directory
-            // Pattern: {rid}.Release/corehost/ or linux-arm64.Release/corehost/
-            var corehostDir = FindCorehostDirectory(extractDir, platformMoniker);
-
+            var corehostDir = FindCorehostDirectory(extractDir, rid);
             if (corehostDir != null)
             {
-                // Copy libhostpolicy to shared framework
-                CopyFileIfExists(corehostDir, sharedFrameworkDir, GetNativeLibName("hostpolicy"));
+                // hostpolicy lives in the shared framework dir.
+                filesCopied += CopyHostBinaryIfPresent(corehostDir, sharedFrameworkDir, GetNativeLibName("hostpolicy"));
 
-                // Copy libhostfxr to host/fxr/{version}/
+                // hostfxr lives at host/fxr/{version}/.
                 var hostFxrDir = Path.Combine(dotnetHome, "host", "fxr", runtimeVersion);
-                Directory.CreateDirectory(hostFxrDir);
-                CopyFileIfExists(corehostDir, hostFxrDir, GetNativeLibName("hostfxr"));
+                if (Directory.Exists(hostFxrDir))
+                {
+                    filesCopied += CopyHostBinaryIfPresent(corehostDir, hostFxrDir, GetNativeLibName("hostfxr"));
+                }
 
-                Log.Info($"Build Cache: Copied host binaries.");
+                // The dotnet host lives at the dotnetHome root.
+                filesCopied += CopyHostBinaryIfPresent(corehostDir, dotnetHome, GetDotnetExecutableName());
             }
 
-            // Write a .version file with the commit SHA for traceability
-            var versionFilePath = Path.Combine(sharedFrameworkDir, ".version");
-            await File.WriteAllTextAsync(versionFilePath, $"{commitSha}\n{runtimeVersion}\n", cancellationToken);
-
-            if (filesCopied == 0)
-            {
-                throw new InvalidOperationException($"Build Cache: No runtime files found to extract. The archive may not contain the expected layout for platform '{platformMoniker}'.");
-            }
-
-            return runtimeVersion;
+            return filesCopied;
         }
 
-        /// <summary>
-        /// Determines the runtime version from extracted artifacts.
-        /// </summary>
-        private static string DetermineRuntimeVersion(string extractDir, string versionPrefix, string commitSha)
-        {
-            // Look for .version file in the shared framework subdirectory of the archive
-            var versionFiles = Directory.GetFiles(extractDir, ".version", SearchOption.AllDirectories);
-
-            foreach (var versionFile in versionFiles)
-            {
-                try
-                {
-                    var lines = File.ReadAllLines(versionFile);
-                    // The .version file typically has: line 0 = commit hash, line 1 = version string
-                    if (lines.Length >= 2 && lines[1].StartsWith(versionPrefix, StringComparison.OrdinalIgnoreCase))
-                    {
-                        return lines[1].Trim();
-                    }
-                }
-                catch
-                {
-                    // Continue searching
-                }
-            }
-
-            // Fallback: construct a version string from the prefix and commit
-            return $"{versionPrefix}.0-buildcache.{commitSha.Substring(0, Math.Min(8, commitSha.Length))}";
-        }
-
-        /// <summary>
-        /// Reads the runtime version from an already-installed BCS runtime.
-        /// </summary>
-        private static string ReadInstalledBuildCacheVersion(string dotnetHome, string targetFramework)
-        {
-            var versionPrefix = ExtractVersionPrefix(targetFramework);
-            var sharedDir = Path.Combine(dotnetHome, "shared", "Microsoft.NETCore.App");
-
-            if (!Directory.Exists(sharedDir))
-            {
-                return null;
-            }
-
-            // Find directories matching the version prefix that have a .version file with a commit SHA
-            foreach (var dir in Directory.GetDirectories(sharedDir).OrderByDescending(d => d))
-            {
-                var dirName = Path.GetFileName(dir);
-                if (dirName.StartsWith(versionPrefix, StringComparison.OrdinalIgnoreCase))
-                {
-                    var versionFile = Path.Combine(dir, ".version");
-                    if (File.Exists(versionFile))
-                    {
-                        var lines = File.ReadAllLines(versionFile);
-                        if (lines.Length >= 2)
-                        {
-                            return lines[1].Trim();
-                        }
-                    }
-                }
-            }
-
-            return null;
-        }
+        // --- HTTP / latestBuilds.json -------------------------------------------------
 
         private static async Task<LatestBuildsResponse> GetLatestBuildsAsync(
             string baseUrl, string repoName, string branch, CancellationToken cancellationToken)
         {
-            var cacheKey = $"{baseUrl}|{repoName}/{branch}";
+            var normalizedBaseUrl = (baseUrl ?? string.Empty).TrimEnd('/');
+            var cacheKey = $"{normalizedBaseUrl}|{repoName}|{branch}";
 
             if (_latestBuildsCache.TryGetValue(cacheKey, out var cached) &&
                 DateTimeOffset.UtcNow - cached.fetchedAt < _latestBuildsCacheDuration)
@@ -585,31 +262,87 @@ namespace Microsoft.Crank.Agent
                 return cached.data;
             }
 
-            var url = $"{baseUrl}/builds/{repoName}/latest/{branch}/latestBuilds.json";
+            // Branch may contain slashes (e.g., "release/10.0"). Escape each segment but keep
+            // the slash semantics so the URL still resolves correctly on the server.
+            var escapedBranch = string.Join("/", branch.Split('/').Select(Uri.EscapeDataString));
+            var url = $"{normalizedBaseUrl}/builds/{Uri.EscapeDataString(repoName)}/latest/{escapedBranch}/latestBuilds.json";
+
             Log.Info($"Build Cache: Fetching latest builds from {url}");
 
-            using var response = await _httpClient.GetAsync(url, cancellationToken);
-
-            if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
+            string json = null;
+            await ProcessUtil.RetryOnExceptionAsync(DownloadRetryCount, async () =>
             {
-                throw new InvalidOperationException($"Build Cache: No latest builds found for branch '{branch}' in repo '{repoName}'. URL: {url}");
-            }
+                using var response = await _httpClient.GetAsync(url, cancellationToken);
 
-            response.EnsureSuccessStatusCode();
+                if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
+                {
+                    throw new InvalidOperationException(
+                        $"Build Cache: No latest builds found for branch '{branch}' in repo '{repoName}'. URL: {url}");
+                }
 
-            var json = await response.Content.ReadAsStringAsync(cancellationToken);
+                response.EnsureSuccessStatusCode();
+                json = await response.Content.ReadAsStringAsync(cancellationToken);
+            });
+
             var latestBuilds = ParseLatestBuilds(json);
-
             _latestBuildsCache[cacheKey] = (DateTimeOffset.UtcNow, latestBuilds);
-
             return latestBuilds;
+        }
+
+        private static async Task DownloadWithRetryAsync(string url, string destination, CancellationToken cancellationToken)
+        {
+            var partial = destination + ".partial";
+
+            await ProcessUtil.RetryOnExceptionAsync(DownloadRetryCount, async () =>
+            {
+                if (File.Exists(partial))
+                {
+                    File.Delete(partial);
+                }
+
+                using (var response = await _httpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancellationToken))
+                {
+                    if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
+                    {
+                        // Don't retry 404s; they aren't transient.
+                        throw new InvalidOperationException(
+                            $"Build Cache: Artifact not found at {url}. The build may not exist in the cache.");
+                    }
+
+                    response.EnsureSuccessStatusCode();
+
+                    var expectedLength = response.Content.Headers.ContentLength;
+
+                    using (var fileStream = File.Create(partial))
+                    {
+                        await response.Content.CopyToAsync(fileStream, cancellationToken);
+                    }
+
+                    if (expectedLength.HasValue)
+                    {
+                        var actual = new FileInfo(partial).Length;
+                        if (actual != expectedLength.Value)
+                        {
+                            throw new InvalidOperationException(
+                                $"Build Cache: Download size mismatch (expected {expectedLength.Value}, got {actual}). URL: {url}");
+                        }
+                    }
+                }
+
+                if (File.Exists(destination))
+                {
+                    File.Delete(destination);
+                }
+
+                File.Move(partial, destination);
+            });
         }
 
         /// <summary>
         /// Parses the latestBuilds.json format from BCS. The JSON has dynamic keys for each
-        /// build configuration, with "branch_name" as a special key.
+        /// build configuration plus a "branch_name" / "BranchName" string property.
         /// </summary>
-        private static LatestBuildsResponse ParseLatestBuilds(string json)
+        internal static LatestBuildsResponse ParseLatestBuilds(string json)
         {
             var result = new LatestBuildsResponse();
 
@@ -617,9 +350,13 @@ namespace Microsoft.Crank.Agent
 
             foreach (var property in doc.RootElement.EnumerateObject())
             {
-                if (property.Name == "branch_name")
+                if (property.Name.Equals("branch_name", StringComparison.OrdinalIgnoreCase) ||
+                    property.Name.Equals("BranchName", StringComparison.Ordinal))
                 {
-                    result.BranchName = property.Value.GetString();
+                    if (property.Value.ValueKind == JsonValueKind.String)
+                    {
+                        result.BranchName = property.Value.GetString();
+                    }
                     continue;
                 }
 
@@ -627,12 +364,8 @@ namespace Microsoft.Crank.Agent
                 {
                     var entry = new LatestBuildEntry
                     {
-                        CommitSha = property.Value.TryGetProperty("CommitSha", out var sha) ? sha.GetString()
-                                  : property.Value.TryGetProperty("commit_sha", out sha) ? sha.GetString()
-                                  : null,
-                        CommitTime = property.Value.TryGetProperty("CommitTime", out var time) ? time.GetString()
-                                   : property.Value.TryGetProperty("commit_time", out time) ? time.GetString()
-                                   : null,
+                        CommitSha = TryGetStringPropertyAnyCase(property.Value, "CommitSha", "commit_sha"),
+                        CommitTime = TryGetStringPropertyAnyCase(property.Value, "CommitTime", "commit_time"),
                     };
 
                     result.Entries[property.Name] = entry;
@@ -642,6 +375,119 @@ namespace Microsoft.Crank.Agent
             return result;
         }
 
+        private static string TryGetStringPropertyAnyCase(JsonElement element, params string[] names)
+        {
+            foreach (var name in names)
+            {
+                if (element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String)
+                {
+                    return value.GetString();
+                }
+            }
+
+            return null;
+        }
+
+        // --- Extraction ---------------------------------------------------------------
+
+        private static Task ExtractArchiveAsync(string archivePath, string outputDir, CancellationToken cancellationToken)
+        {
+            Directory.CreateDirectory(outputDir);
+
+            if (archivePath.EndsWith(".tar.gz", StringComparison.OrdinalIgnoreCase))
+            {
+                return ExtractTarGzAsync(archivePath, outputDir, cancellationToken);
+            }
+
+            if (archivePath.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
+            {
+                return Task.Run(() => ZipFile.ExtractToDirectory(archivePath, outputDir, overwriteFiles: true), cancellationToken);
+            }
+
+            throw new InvalidOperationException($"Unsupported archive format: {archivePath}");
+        }
+
+        private static async Task ExtractTarGzAsync(string archivePath, string outputDir, CancellationToken cancellationToken)
+        {
+            await using var fs = File.OpenRead(archivePath);
+            await using var gz = new GZipStream(fs, CompressionMode.Decompress);
+            await TarFile.ExtractToDirectoryAsync(gz, outputDir, overwriteFiles: true, cancellationToken: cancellationToken);
+        }
+
+        // --- Overlay helpers ----------------------------------------------------------
+
+        private static int CopyManaged(string runtimesDir, string destinationDir)
+        {
+            int copied = 0;
+            var libDir = Path.Combine(runtimesDir, "lib");
+            if (!Directory.Exists(libDir))
+            {
+                return 0;
+            }
+
+            // Pick the highest-versioned net{X}.0 directory (the archive should only ship one).
+            var managedDir = Directory.GetDirectories(libDir)
+                .OrderByDescending(d => Path.GetFileName(d), StringComparer.OrdinalIgnoreCase)
+                .FirstOrDefault();
+
+            if (managedDir == null)
+            {
+                return 0;
+            }
+
+            Directory.CreateDirectory(destinationDir);
+
+            foreach (var file in Directory.GetFiles(managedDir, "*.dll"))
+            {
+                var dest = Path.Combine(destinationDir, Path.GetFileName(file));
+                File.Copy(file, dest, overwrite: true);
+                copied++;
+            }
+
+            return copied;
+        }
+
+        private static int CopyNative(string runtimesDir, string destinationDir)
+        {
+            int copied = 0;
+            var nativeDir = Path.Combine(runtimesDir, "native");
+            if (!Directory.Exists(nativeDir))
+            {
+                return 0;
+            }
+
+            Directory.CreateDirectory(destinationDir);
+
+            foreach (var file in Directory.GetFiles(nativeDir))
+            {
+                var fileName = Path.GetFileName(file);
+                if (fileName.EndsWith(".pdb", StringComparison.OrdinalIgnoreCase) ||
+                    fileName.EndsWith(".dbg", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var dest = Path.Combine(destinationDir, fileName);
+                File.Copy(file, dest, overwrite: true);
+                copied++;
+            }
+
+            return copied;
+        }
+
+        private static int CopyHostBinaryIfPresent(string sourceDir, string destDir, string fileName)
+        {
+            var src = Path.Combine(sourceDir, fileName);
+            if (!File.Exists(src))
+            {
+                return 0;
+            }
+
+            Directory.CreateDirectory(destDir);
+            File.Copy(src, Path.Combine(destDir, fileName), overwrite: true);
+            return 1;
+        }
+
         private static string FindDirectory(string root, string directoryName)
         {
             if (!Directory.Exists(root))
@@ -649,7 +495,6 @@ namespace Microsoft.Crank.Agent
                 return null;
             }
 
-            // Check direct children first
             foreach (var dir in Directory.GetDirectories(root))
             {
                 if (Path.GetFileName(dir).Equals(directoryName, StringComparison.OrdinalIgnoreCase))
@@ -661,123 +506,111 @@ namespace Microsoft.Crank.Agent
             return null;
         }
 
-        private static string FindCorehostDirectory(string extractDir, string platformMoniker)
+        private static string FindCorehostDirectory(string extractDir, string rid)
         {
-            // BCS layout: {rid}.Release/corehost/ (e.g., linux-arm64.Release/corehost/)
-            // Map RID to the directory name format used in BCS artifacts
-            var ridDirName = $"{platformMoniker}.Release";
-            var corehostPath = Path.Combine(extractDir, ridDirName, "corehost");
-
-            if (Directory.Exists(corehostPath))
+            var primary = Path.Combine(extractDir, $"{rid}.Release", "corehost");
+            if (Directory.Exists(primary))
             {
-                return corehostPath;
+                return primary;
             }
 
-            // Also try the raw format without dots
-            var altCorehostPath = Path.Combine(extractDir, "corehost");
-            if (Directory.Exists(altCorehostPath))
+            var alternate = Path.Combine(extractDir, "corehost");
+            if (Directory.Exists(alternate))
             {
-                return altCorehostPath;
+                return alternate;
             }
 
             return null;
         }
 
-        private static void CopyFileIfExists(string sourceDir, string destDir, string fileName)
+        // --- Platform / RID mapping ---------------------------------------------------
+
+        private static string ResolveBuildCacheConfig(string buildCacheConfig)
         {
-            var sourcePath = Path.Combine(sourceDir, fileName);
-            if (File.Exists(sourcePath))
+            if (!string.IsNullOrEmpty(buildCacheConfig))
             {
-                File.Copy(sourcePath, Path.Combine(destDir, fileName), overwrite: true);
+                return buildCacheConfig;
             }
+
+            var rid = GetPlatformMoniker();
+            if (PlatformToBcsConfig.TryGetValue(rid, out var mapped))
+            {
+                return mapped.configKey;
+            }
+
+            throw new InvalidOperationException(
+                $"No Build Cache configuration mapping for platform '{rid}'. Specify buildCacheConfig explicitly.");
         }
 
-        private static string GetNativeLibName(string baseName)
+        private static string GetArtifactFile(string buildCacheConfig)
+        {
+            var match = PlatformToBcsConfig.Values.FirstOrDefault(v =>
+                string.Equals(v.configKey, buildCacheConfig, StringComparison.OrdinalIgnoreCase));
+
+            if (match.artifactFile == null)
+            {
+                throw new InvalidOperationException(
+                    $"Unknown Build Cache configuration key: '{buildCacheConfig}'.");
+            }
+
+            return match.artifactFile;
+        }
+
+        internal static string GetNativeLibName(string baseName)
         {
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
                 return $"{baseName}.dll";
             }
-            else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
             {
                 return $"lib{baseName}.dylib";
             }
-            else
-            {
-                return $"lib{baseName}.so";
-            }
+
+            return $"lib{baseName}.so";
         }
 
-        private static string GetPlatformMoniker()
+        private static string GetDotnetExecutableName()
+            => RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "dotnet.exe" : "dotnet";
+
+        internal static string GetPlatformMoniker()
         {
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
-                return RuntimeInformation.ProcessArchitecture == Architecture.Arm64 ? "win-arm64"
-                     : RuntimeInformation.ProcessArchitecture == Architecture.X86 ? "win-x86"
-                     : "win-x64";
+                return RuntimeInformation.ProcessArchitecture switch
+                {
+                    Architecture.Arm64 => "win-arm64",
+                    Architecture.X86 => "win-x86",
+                    _ => "win-x64",
+                };
             }
-            else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
             {
                 return RuntimeInformation.ProcessArchitecture == Architecture.Arm64 ? "osx-arm64" : "osx-x64";
             }
-            else
-            {
-                return RuntimeInformation.ProcessArchitecture == Architecture.Arm64 ? "linux-arm64" : "linux-x64";
-            }
+
+            return RuntimeInformation.ProcessArchitecture == Architecture.Arm64 ? "linux-arm64" : "linux-x64";
         }
 
-        private static string ExtractVersionPrefix(string targetFramework)
+        private static string SanitizeForPath(string value)
         {
-            if (string.IsNullOrWhiteSpace(targetFramework))
+            if (string.IsNullOrEmpty(value))
             {
-                throw new InvalidOperationException("Target framework must be specified.");
+                return "default";
             }
 
-            // "net10.0" → "10.0", "net9.0" → "9.0"
-            if (targetFramework.StartsWith("net", StringComparison.OrdinalIgnoreCase) &&
-                targetFramework.Length > 3 &&
-                char.IsDigit(targetFramework[3]))
-            {
-                return targetFramework.Substring(3);
-            }
-
-            // "netcoreapp3.1" → "3.1"
-            if (targetFramework.StartsWith("netcoreapp", StringComparison.OrdinalIgnoreCase) &&
-                targetFramework.Length > "netcoreapp".Length)
-            {
-                return targetFramework.Substring("netcoreapp".Length);
-            }
-
-            throw new InvalidOperationException(
-                $"Unsupported target framework '{targetFramework}' for Build Cache runtime version inference.");
+            var invalid = Path.GetInvalidFileNameChars();
+            return string.Concat(value.Select(c => invalid.Contains(c) ? '_' : c));
         }
 
-        private static async Task ExtractTarGzAsync(string archivePath, string outputDir, CancellationToken cancellationToken)
-        {
-            Directory.CreateDirectory(outputDir);
+        internal static string ShortSha(string commitSha)
+            => string.IsNullOrEmpty(commitSha)
+                ? string.Empty
+                : commitSha.Substring(0, Math.Min(8, commitSha.Length));
 
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-            {
-                // On Windows, use tar (available since Windows 10 1803)
-                var result = await ProcessUtil.RunAsync("tar", $"-xzf \"{archivePath}\" -C \"{outputDir}\"",
-                    throwOnError: false, cancellationToken: cancellationToken);
-
-                if (result.ExitCode != 0)
-                {
-                    throw new InvalidOperationException($"Failed to extract tar.gz: {result.StandardError}");
-                }
-            }
-            else
-            {
-                var result = await ProcessUtil.RunAsync("/usr/bin/env", $"tar -xzf \"{archivePath}\" -C \"{outputDir}\"",
-                    throwOnError: false, cancellationToken: cancellationToken);
-
-                if (result.ExitCode != 0)
-                {
-                    throw new InvalidOperationException($"Failed to extract tar.gz: {result.StandardError}");
-                }
-            }
-        }
+        // --- DTOs ---------------------------------------------------------------------
 
         internal class LatestBuildsResponse
         {

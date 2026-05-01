@@ -2983,11 +2983,20 @@ namespace Microsoft.Crank.Agent
             string buildCacheCommitSha = null;
             string buildCacheExtractDir = null;
 
+            string buildCacheConfigResolved = null;
             if (useBuildCache)
             {
                 if (!_buildCacheEnabled)
                 {
                     job.Error = "Build Cache channel was requested but Build Cache Service is disabled on this agent (--build-cache-disabled).";
+                    return null;
+                }
+
+                // Validate user-supplied commit SHA early so we can fail with a clear message instead
+                // of throwing later from a Substring call.
+                if (!string.IsNullOrEmpty(job.BuildCacheCommitSha) && job.BuildCacheCommitSha.Length < 8)
+                {
+                    job.Error = $"Build Cache: 'buildCacheCommitSha' must be at least 8 characters long (got '{job.BuildCacheCommitSha}').";
                     return null;
                 }
 
@@ -2997,21 +3006,24 @@ namespace Microsoft.Crank.Agent
                     var commitSha = job.BuildCacheCommitSha;
                     var buildCacheConfig = job.BuildCacheConfig;
 
-                    // Resolve which commit to use
+                    // Resolve which commit and config to use
                     var resolved = await BuildCacheClient.ResolveCommitAsync(
-                        _buildCacheBaseUrl, _buildCacheRepoName, branch, commitSha, buildCacheConfig);
+                        _buildCacheBaseUrl, _buildCacheRepoName, branch, commitSha, buildCacheConfig, cancellationToken);
 
                     buildCacheCommitSha = resolved.commitSha;
+                    buildCacheConfigResolved = resolved.buildCacheConfig;
 
-                    // Download and extract the BCS artifacts to a temp directory
+                    // Download and extract the BCS artifacts to a per-job temp directory
                     buildCacheExtractDir = await BuildCacheClient.DownloadAndExtractAsync(
-                        _buildCacheBaseUrl, _buildCacheRepoName, buildCacheCommitSha, buildCacheConfig,
-                        targetFramework, cancellationToken);
+                        _buildCacheBaseUrl, _buildCacheRepoName, buildCacheCommitSha, buildCacheConfigResolved,
+                        cancellationToken);
 
-                    var shortSha = buildCacheCommitSha.Substring(0, Math.Min(8, buildCacheCommitSha.Length));
+                    var shortSha = BuildCacheClient.ShortSha(buildCacheCommitSha);
                     Log.Info($"Build Cache: Artifacts for commit {shortSha} ready for post-build overlay");
 
-                    // Resolve a REAL runtime version from feeds for the NuGet build
+                    // Resolve a REAL runtime version from feeds for the NuGet build. We deliberately keep
+                    // runtimeVersion pointing at this feed-resolved version so PatchRuntimeConfig and the
+                    // dotnet-install steps agree; the BCS bits are overlaid on top of that exact version.
                     runtimeVersion = await ResolveRuntimeVersion(buildToolsPath, targetFramework, "Latest");
                     Log.Info($"Runtime for build: {runtimeVersion} (Latest from feeds, will be overlaid with BCS commit {shortSha})");
                 }
@@ -3506,23 +3518,44 @@ namespace Microsoft.Crank.Agent
 
                 Log.Info($"Application published successfully in {job.BuildTime.TotalMilliseconds} ms");
 
-                // Build Cache: overlay BCS runtime binaries into the published output
-                // This replaces the NuGet-sourced runtime DLLs with BCS-built ones from the specific commit
+                // Build Cache: overlay BCS runtime binaries onto the just-published app and the
+                // agent's installed shared framework. We overlay BOTH targets so that:
+                //   - self-contained jobs (which load the runtime from outputFolder) see BCS bits, and
+                //   - framework-dependent jobs (which load the runtime from dotnetHome/shared/...) see BCS bits.
+                // PatchRuntimeConfig still runs with the feed-resolved runtimeVersion so runtimeconfig.json
+                // points to a real installed directory; the BCS overlay replaces the binaries inside it.
                 if (useBuildCache && buildCacheExtractDir != null)
                 {
+                    var shortSha = BuildCacheClient.ShortSha(buildCacheCommitSha);
+                    int totalOverlaid;
+
                     try
                     {
-                        var shortSha = buildCacheCommitSha.Substring(0, Math.Min(8, buildCacheCommitSha.Length));
-                        var overlayCount = BuildCacheClient.OverlayPublishedOutput(buildCacheExtractDir, outputFolder);
-                        Log.Info($"Build Cache: Overlaid {overlayCount} runtime files from commit {shortSha} into published output");
+                        var publishedOverlay = BuildCacheClient.OverlayPublishedOutput(buildCacheExtractDir, outputFolder);
+                        var dotnetHomeOverlay = BuildCacheClient.OverlayDotnetHome(buildCacheExtractDir, dotnetHome, runtimeVersion);
+                        totalOverlaid = publishedOverlay + dotnetHomeOverlay;
 
-                        // Update the reported runtime version to reflect the BCS commit (for metadata/reporting only)
-                        job.RuntimeVersion = $"{runtimeVersion}+buildcache.{shortSha}";
+                        Log.Info($"Build Cache: Overlaid {publishedOverlay} files into published output and " +
+                                 $"{dotnetHomeOverlay} files into dotnet home (commit {shortSha})");
                     }
                     catch (Exception ex)
                     {
-                        Log.Info($"Build Cache: Warning - overlay failed: {ex.Message}. Published app will use feed-sourced runtime.");
+                        job.Error = $"Build Cache: overlay failed: {ex.Message}";
+                        return null;
                     }
+
+                    if (totalOverlaid == 0)
+                    {
+                        // Silently skipping the overlay would mean the benchmark runs against the FEED runtime
+                        // instead of the BCS commit, which is the worst possible outcome for bisection. Fail.
+                        job.Error = $"Build Cache: overlay copied 0 files for commit {shortSha}. " +
+                                    "The archive layout may have changed or the platform is not supported.";
+                        return null;
+                    }
+
+                    // Record the BCS commit alongside the runtime version for reporting. We append rather than
+                    // replace so PatchRuntimeConfig still sees a valid feed-resolved version below.
+                    job.RuntimeVersion = $"{runtimeVersion}+buildcache.{shortSha}";
                 }
 
                 PatchRuntimeConfig(job, outputFolder, aspNetCoreVersion, runtimeVersion);
