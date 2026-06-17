@@ -186,6 +186,31 @@ namespace Microsoft.Crank.Models
         public bool DotNetTrace { get; set; }
         public string DotNetTraceProviders { get; set; }
 
+        // Size (in MB) of the EventPipe circular buffer used by dotnet-trace collection.
+        // Default of 256 preserves the legacy hardcoded value.
+        public int DotNetTraceBufferSizeMB { get; set; } = 256;
+
+        // Whether to request a rundown phase at the end of the EventPipe session.
+        // Default of true preserves the legacy implicit overload behavior.
+        public bool DotNetTraceRequestRundown { get; set; } = true;
+
+        // Selects how dotnet-trace captures the trace:
+        //   "default"      - in-process EventPipe via DiagnosticsClient (today's behavior).
+        //   "collect"      - shells out to the dotnet-trace CLI's `collect` verb.
+        //   "collect-linux"- shells out to the dotnet-trace CLI's `collect-linux` verb,
+        //                    which uses perf_event_open to capture kernel + native frames
+        //                    machine-wide. Linux-only, requires root and kernel >= 6.4.
+        // Default of "default" preserves the legacy in-process behavior so that
+        // mixed-version controller/agent combinations stay byte-for-byte equivalent.
+        public string DotNetTraceCollectMode { get; set; } = "default";
+
+        // Grace period (seconds) to wait for `dotnet-trace` to finalize a trace after
+        // SIGINT before considering the trace possibly incomplete. Only used by the
+        // CLI collect modes (`collect`, `collect-linux`). A value of 0 selects the
+        // per-mode default (60s for collect, 180s for collect-linux). Timeout logs
+        // [WRN] and keeps the partial trace but does not fail the job.
+        public int DotNetTraceStopTimeoutSec { get; set; } = 0;
+
         // Dump
         public bool DumpProcess { get; set; }
         public DumpTypeOption DumpType { get; set; } = DumpTypeOption.Mini;
