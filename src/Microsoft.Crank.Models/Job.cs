@@ -71,15 +71,16 @@ namespace Microsoft.Crank.Models
         public string UseMonoRuntime { get; set; } = "";
         public bool NoGlobalJson { get; set; }
 
-        // Build Cache Service properties for per-commit runtime resolution
-        public string BuildCacheCommitSha { get; set; } = "";
-        public string BuildCacheBranch { get; set; } = "";
-        public string BuildCacheConfig { get; set; } = "";
-
-        // Selects which BCS repository the buildcache channel resolves from: "runtime" (default,
-        // overrides Microsoft.NETCore.App) or "aspnetcore" (overrides Microsoft.AspNetCore.App).
-        // Empty falls back to the agent-level --build-cache-repo-name default.
-        public string BuildCacheRepo { get; set; } = "";
+        // Build Cache Service properties for per-commit framework resolution. On the "buildcache"
+        // channel BOTH the base runtime (Microsoft.NETCore.App, from dotnet/runtime) and the ASP.NET
+        // Core shared framework (Microsoft.AspNetCore.App, from dotnet/aspnetcore) are overridden from
+        // BCS. Each repo resolves independently: an empty commit sha means "latest build on that repo's
+        // branch"; a sha pins/bisects that repo while the other stays latest. RID/config is auto-derived
+        // from the agent platform per repo.
+        public string BuildCacheRuntimeCommitSha { get; set; } = "";
+        public string BuildCacheAspNetCoreCommitSha { get; set; } = "";
+        public string BuildCacheRuntimeBranch { get; set; } = "";
+        public string BuildCacheAspNetCoreBranch { get; set; } = "";
 
         // Delay from the process started to the console receiving "Application started"
         public TimeSpan StartupMainMethod { get; set; }
@@ -410,10 +411,10 @@ namespace Microsoft.Crank.Models
                 DockerFile = DockerFile,
                 DockerImageName = DockerImageName,
                 DockerContextDirectory = DockerContextDirectory,
-                BuildCacheCommitSha = BuildCacheCommitSha,
-                BuildCacheBranch = BuildCacheBranch,
-                BuildCacheConfig = BuildCacheConfig,
-                BuildCacheRepo = BuildCacheRepo
+                BuildCacheRuntimeCommitSha = BuildCacheRuntimeCommitSha,
+                BuildCacheAspNetCoreCommitSha = BuildCacheAspNetCoreCommitSha,
+                BuildCacheRuntimeBranch = BuildCacheRuntimeBranch,
+                BuildCacheAspNetCoreBranch = BuildCacheAspNetCoreBranch
             };
         }
 
@@ -522,9 +523,9 @@ namespace Microsoft.Crank.Models
         public string DockerFile { get; set; }
         public string DockerImageName { get; set; }
         public string DockerContextDirectory { get; set; }
-        public string BuildCacheCommitSha { get; set; }
-        public string BuildCacheBranch { get; set; }
-        public string BuildCacheConfig { get; set; }
-        public string BuildCacheRepo { get; set; }
+        public string BuildCacheRuntimeCommitSha { get; set; }
+        public string BuildCacheAspNetCoreCommitSha { get; set; }
+        public string BuildCacheRuntimeBranch { get; set; }
+        public string BuildCacheAspNetCoreBranch { get; set; }
     }
 }

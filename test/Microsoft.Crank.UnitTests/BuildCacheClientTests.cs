@@ -366,7 +366,9 @@ namespace Microsoft.Crank.UnitTests
             var commitSha = "603403d9cb49d3d1c35b56bcff024ce99a8c5c3a";
 
             var bcsHome = BuildCacheClient.CreateBuildCacheDotnetHome(
-                globalHome, extractDir, runtimeVersion, aspNetCoreVersion, commitSha, configKey);
+                globalHome, runtimeVersion, aspNetCoreVersion,
+                extractDir, commitSha, configKey,
+                null, null, null);
 
             try
             {
@@ -425,8 +427,9 @@ namespace Microsoft.Crank.UnitTests
             // Will resolve config from host RID and search for hostRid-shaped subtree → 0 files.
             var ex = Assert.Throws<InvalidOperationException>(() =>
                 BuildCacheClient.CreateBuildCacheDotnetHome(
-                    globalHome, extractDir, runtimeVersion, aspNetCoreVersion,
-                    "abcdef0123456789", buildCacheConfig: null));
+                    globalHome, runtimeVersion, aspNetCoreVersion,
+                    extractDir, "abcdef0123456789", null,
+                    null, null, null));
 
             Assert.Contains("0 files", ex.Message);
         }
@@ -445,9 +448,11 @@ namespace Microsoft.Crank.UnitTests
             var sha2 = "6666eeee7777ffff8888aaaa9999bbbbccccdddd";
 
             var home1 = BuildCacheClient.CreateBuildCacheDotnetHome(
-                globalHome, extractDir1, runtimeVersion, runtimeVersion, sha1, configKey);
+                globalHome, runtimeVersion, runtimeVersion,
+                extractDir1, sha1, configKey, null, null, null);
             var home2 = BuildCacheClient.CreateBuildCacheDotnetHome(
-                globalHome, extractDir2, runtimeVersion, runtimeVersion, sha2, configKey);
+                globalHome, runtimeVersion, runtimeVersion,
+                extractDir2, sha2, configKey, null, null, null);
 
             try
             {
@@ -543,8 +548,9 @@ namespace Microsoft.Crank.UnitTests
             var commitSha = "aaaabbbbccccddddeeeeffff0000111122223333";
 
             var bcsHome = BuildCacheClient.CreateBuildCacheDotnetHome(
-                globalHome, extractDir, runtimeVersion, aspNetCoreVersion, commitSha, configKey,
-                BuildCacheClient.BuildCacheFlavor.AspNetCore);
+                globalHome, runtimeVersion, aspNetCoreVersion,
+                null, null, null,
+                extractDir, commitSha, configKey);
 
             try
             {
@@ -584,6 +590,67 @@ namespace Microsoft.Crank.UnitTests
         }
 
         [Fact]
+        public void CreateBuildCacheDotnetHome_BothFrameworks_OverlaysRuntimeAndPlacesAspNetCore()
+        {
+            var rid = BuildCacheClient.GetPlatformMoniker();
+            var runtimeConfigKey = ConfigKeyForRid(rid);
+            var aspNetConfigKey = AspNetConfigKeyForRid(rid);
+            var (runtimeExtractDir, _, runtimeManaged, runtimeNative) = BuildFakeBcsArchive(rid, includeHost: true, includeApphost: false);
+            var (aspNetExtractDir, aspNetManaged) = BuildFakeAspNetCoreBcsArchive(rid);
+
+            const string runtimeVersion = "11.0.0-preview.5.26256.117";
+            const string aspNetCoreVersion = "11.0.0-preview.5.26256.117";
+            var globalHome = BuildFakeGlobalDotnetHome(runtimeVersion, aspNetCoreVersion);
+            var runtimeSha = "1111aaaa2222bbbb3333cccc4444dddd55556666";
+            var aspNetSha = "aaaabbbbccccddddeeeeffff0000111122223333";
+
+            var bcsHome = BuildCacheClient.CreateBuildCacheDotnetHome(
+                globalHome, runtimeVersion, aspNetCoreVersion,
+                runtimeExtractDir, runtimeSha, runtimeConfigKey,
+                aspNetExtractDir, aspNetSha, aspNetConfigKey);
+
+            try
+            {
+                // 1. Base runtime overlaid from the runtime pack; .version carries the runtime sha.
+                var bcsNetCoreApp = Path.Combine(bcsHome, "shared", "Microsoft.NETCore.App", runtimeVersion);
+                foreach (var dll in runtimeManaged)
+                {
+                    Assert.True(File.Exists(Path.Combine(bcsNetCoreApp, dll)), $"Missing BCS runtime managed {dll}");
+                }
+                foreach (var n in runtimeNative)
+                {
+                    Assert.True(File.Exists(Path.Combine(bcsNetCoreApp, n)), $"Missing BCS runtime native {n}");
+                }
+                var netCoreVersion = File.ReadAllText(Path.Combine(bcsNetCoreApp, ".version"));
+                Assert.Contains(runtimeSha, netCoreVersion);
+                Assert.DoesNotContain(aspNetSha, netCoreVersion);
+
+                // 2. ASP.NET Core placed directly from the aspnetcore pack; .version carries the aspnet sha.
+                var bcsAspNet = Path.Combine(bcsHome, "shared", "Microsoft.AspNetCore.App", aspNetCoreVersion);
+                foreach (var dll in aspNetManaged)
+                {
+                    Assert.True(File.Exists(Path.Combine(bcsAspNet, dll)), $"Missing BCS aspnetcore managed {dll}");
+                }
+                Assert.True(File.Exists(Path.Combine(bcsAspNet, "Microsoft.AspNetCore.App.deps.json")));
+                Assert.True(File.Exists(Path.Combine(bcsAspNet, "Microsoft.AspNetCore.App.runtimeconfig.json")));
+                Assert.False(File.Exists(Path.Combine(bcsAspNet, "FeedOnlyAspNet.dll")));
+                var aspNetVersion = File.ReadAllText(Path.Combine(bcsAspNet, ".version"));
+                Assert.Contains(aspNetSha, aspNetVersion);
+                Assert.DoesNotContain(runtimeSha, aspNetVersion);
+
+                // 3. Global home untouched by either overlay.
+                var globalNetCore = File.ReadAllText(Path.Combine(globalHome, "shared", "Microsoft.NETCore.App", runtimeVersion, ".version"));
+                Assert.DoesNotContain(runtimeSha, globalNetCore);
+                var globalAspNet = File.ReadAllText(Path.Combine(globalHome, "shared", "Microsoft.AspNetCore.App", aspNetCoreVersion, ".version"));
+                Assert.DoesNotContain(aspNetSha, globalAspNet);
+            }
+            finally
+            {
+                try { Directory.Delete(bcsHome, recursive: true); } catch { }
+            }
+        }
+
+        [Fact]
         public void CreateBuildCacheDotnetHome_AspNetCore_MissingDepsJson_Throws()
         {
             var rid = BuildCacheClient.GetPlatformMoniker();
@@ -595,8 +662,9 @@ namespace Microsoft.Crank.UnitTests
 
             var ex = Assert.Throws<BuildCacheClient.BuildCacheIncompleteException>(() =>
                 BuildCacheClient.CreateBuildCacheDotnetHome(
-                    globalHome, extractDir, version, version, "abcdef0123456789", configKey,
-                    BuildCacheClient.BuildCacheFlavor.AspNetCore));
+                    globalHome, version, version,
+                    null, null, null,
+                    extractDir, "abcdef0123456789", configKey));
             Assert.Contains("deps.json", ex.Message);
         }
 
@@ -612,8 +680,9 @@ namespace Microsoft.Crank.UnitTests
 
             var ex = Assert.Throws<BuildCacheClient.BuildCacheIncompleteException>(() =>
                 BuildCacheClient.CreateBuildCacheDotnetHome(
-                    globalHome, extractDir, version, version, "abcdef0123456789", configKey,
-                    BuildCacheClient.BuildCacheFlavor.AspNetCore));
+                    globalHome, version, version,
+                    null, null, null,
+                    extractDir, "abcdef0123456789", configKey));
             Assert.Contains("runtimeconfig.json", ex.Message);
         }
 
@@ -629,8 +698,9 @@ namespace Microsoft.Crank.UnitTests
 
             Assert.Throws<ArgumentException>(() =>
                 BuildCacheClient.CreateBuildCacheDotnetHome(
-                    globalHome, extractDir, runtimeVersion, aspNetCoreVersion: "",
-                    "abcdef0123456789", configKey, BuildCacheClient.BuildCacheFlavor.AspNetCore));
+                    globalHome, runtimeVersion, aspNetCoreVersion: "",
+                    null, null, null,
+                    extractDir, "abcdef0123456789", configKey));
         }
 
         // -------------------------------------------------------------------

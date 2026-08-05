@@ -41,11 +41,13 @@ namespace Microsoft.Crank.Agent
         public string BuildCacheDotnetHome { get; set; }
 
         /// <summary>
-        /// Temporary directory holding the extracted BCS archive for this job. Deleted at the
-        /// end of the job; the underlying archive in the parent commit directory is kept so
-        /// subsequent jobs for the same commit can reuse it without re-downloading.
+        /// Temporary directories holding the extracted BCS archives for this job (one per repo:
+        /// runtime and aspnetcore). Deleted at the end of the job; the underlying archives in the
+        /// parent commit directory are kept so subsequent jobs for the same commit can reuse them
+        /// without re-downloading.
         /// </summary>
-        public string BuildCacheExtractDir { get; set; }
+        public string BuildCacheRuntimeExtractDir { get; set; }
+        public string BuildCacheAspNetCoreExtractDir { get; set; }
 
         public ulong EventPipeSessionId { get; set; }
         public Task EventPipeTask { get; set; }

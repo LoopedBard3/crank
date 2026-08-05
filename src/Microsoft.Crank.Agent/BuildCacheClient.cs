@@ -295,174 +295,193 @@ namespace Microsoft.Crank.Agent
         }
 
         /// <summary>
-        /// Builds a per-job dotnet home. The global dotnet home is NOT modified, so concurrent jobs
-        /// and subsequent non-buildcache jobs are unaffected.
+        /// Builds a per-job dotnet home that overlays BOTH frameworks from BCS. The global dotnet home
+        /// is NOT modified, so concurrent jobs and subsequent non-buildcache jobs are unaffected.
         ///
-        /// For <see cref="BuildCacheFlavor.Runtime"/> the home mirrors the feed runtime/asp.net/host
-        /// subtrees and OVERLAYS BCS bits onto the base runtime (Microsoft.NETCore.App) + host. The
-        /// runtime archive is raw build output and does not carry the framework's deps.json/
-        /// runtimeconfig.json, so overlay-onto-feed is required (it reuses the feed metadata).
+        /// The home mirrors the feed host/fxr + base runtime (Microsoft.NETCore.App) subtrees. When a
+        /// runtime BCS extract is supplied it OVERLAYS BCS bits onto the base runtime + host: the runtime
+        /// archive is raw build output and does not carry the framework's deps.json/runtimeconfig.json, so
+        /// overlay-onto-feed is required (it reuses the feed metadata).
         ///
-        /// For <see cref="BuildCacheFlavor.AspNetCore"/> the ASP.NET Core shared framework
-        /// (Microsoft.AspNetCore.App) is PLACED DIRECTLY from the BCS pack — the aspnetcore archive is
-        /// the runtime-pack nupkg stored verbatim, which carries the managed assemblies AND the
-        /// host-resolvable deps.json/runtimeconfig.json, so the framework folder is built entirely from
-        /// BCS (no feed contribution) and fails loud if incomplete. The base runtime + host stay
-        /// feed-cloned (the aspnetcore pack ships neither).
+        /// When an aspnetcore BCS extract is supplied the ASP.NET Core shared framework
+        /// (Microsoft.AspNetCore.App) is PLACED DIRECTLY from the BCS pack — the aspnetcore archive is the
+        /// runtime-pack nupkg stored verbatim, which carries the managed assemblies AND the host-resolvable
+        /// deps.json/runtimeconfig.json, so the framework folder is built entirely from BCS (no feed
+        /// contribution) and fails loud if incomplete. If an aspnetcore extract is NOT supplied the feed
+        /// copy is cloned instead.
+        ///
+        /// On the buildcache channel both extracts are supplied (both frameworks overridden); the per-side
+        /// parameters remain nullable so a single framework can be overlaid in isolation (e.g. unit tests).
         /// </summary>
         /// <returns>Absolute path to the per-job dotnet home root. Caller owns it.</returns>
         public static string CreateBuildCacheDotnetHome(
             string globalDotnetHome,
-            string extractDir,
             string runtimeVersion,
             string aspNetCoreVersion,
-            string commitSha,
-            string buildCacheConfig,
-            BuildCacheFlavor flavor = BuildCacheFlavor.Runtime)
+            string runtimeExtractDir,
+            string runtimeCommitSha,
+            string runtimeConfig,
+            string aspNetCoreExtractDir,
+            string aspNetCoreCommitSha,
+            string aspNetCoreConfig)
         {
             if (string.IsNullOrEmpty(runtimeVersion))
             {
                 throw new ArgumentException("runtimeVersion must be provided.", nameof(runtimeVersion));
             }
 
-            if (flavor == BuildCacheFlavor.AspNetCore && string.IsNullOrEmpty(aspNetCoreVersion))
+            if (!string.IsNullOrEmpty(aspNetCoreExtractDir) && string.IsNullOrEmpty(aspNetCoreVersion))
             {
                 throw new ArgumentException(
-                    "aspNetCoreVersion must be provided for the aspnetcore build cache flavour (it is the overlay target).",
+                    "aspNetCoreVersion must be provided when an aspnetcore BCS extract is supplied (it is the placement target).",
                     nameof(aspNetCoreVersion));
             }
 
-            buildCacheConfig = ResolveBuildCacheConfig(buildCacheConfig, flavor);
-            var rid = GetRidForConfig(buildCacheConfig);
+            // Short sha tag for the home dir name — prefer whichever override is present.
+            var homeTagSha = ShortSha(runtimeCommitSha);
+            if (string.IsNullOrEmpty(homeTagSha))
+            {
+                homeTagSha = ShortSha(aspNetCoreCommitSha);
+            }
 
             // Per-job, never reused across jobs to avoid pollution.
             var bcsHomeRoot = Path.Combine(
                 Path.GetTempPath(),
                 "crank-buildcache",
-                $"home-{ShortSha(commitSha)}-{SanitizeForPath(buildCacheConfig)}-{Guid.NewGuid():N}");
+                $"home-{homeTagSha}-{Guid.NewGuid():N}");
             Directory.CreateDirectory(bcsHomeRoot);
 
-            // 1. Copy the dotnet host binary.
-            var dotnetExeName = GetDotnetExecutableName();
-            var srcDotnet = Path.Combine(globalDotnetHome, dotnetExeName);
-            if (File.Exists(srcDotnet))
+            try
             {
-                var dstDotnet = Path.Combine(bcsHomeRoot, dotnetExeName);
-                File.Copy(srcDotnet, dstDotnet, overwrite: true);
-                EnsureExecutable(dstDotnet);
-            }
-
-            // 2. Mirror host/fxr/{runtimeVersion} (small dir, ~1 file).
-            var srcHostFxr = Path.Combine(globalDotnetHome, "host", "fxr", runtimeVersion);
-            var dstHostFxr = Path.Combine(bcsHomeRoot, "host", "fxr", runtimeVersion);
-            if (Directory.Exists(srcHostFxr))
-            {
-                CopyDirectory(srcHostFxr, dstHostFxr);
-            }
-
-            // 3. Mirror shared/Microsoft.NETCore.App/{runtimeVersion}.
-            var srcNetCoreApp = Path.Combine(globalDotnetHome, "shared", "Microsoft.NETCore.App", runtimeVersion);
-            var dstNetCoreApp = Path.Combine(bcsHomeRoot, "shared", "Microsoft.NETCore.App", runtimeVersion);
-            if (Directory.Exists(srcNetCoreApp))
-            {
-                CopyDirectory(srcNetCoreApp, dstNetCoreApp);
-            }
-
-            // 4. Mirror shared/Microsoft.AspNetCore.App/{aspNetCoreVersion}.
-            //    For the RUNTIME flavour this is the non-overridden framework, cloned from the feed.
-            //    For the ASPNETCORE flavour we do NOT clone the feed copy — the framework is placed
-            //    directly from the BCS pack below, so no feed assembly can leak into the framework
-            //    that actually runs.
-            var dstAspNet = string.IsNullOrEmpty(aspNetCoreVersion)
-                ? null
-                : Path.Combine(bcsHomeRoot, "shared", "Microsoft.AspNetCore.App", aspNetCoreVersion);
-            if (flavor == BuildCacheFlavor.Runtime && !string.IsNullOrEmpty(aspNetCoreVersion))
-            {
-                var srcAspNet = Path.Combine(globalDotnetHome, "shared", "Microsoft.AspNetCore.App", aspNetCoreVersion);
-                if (Directory.Exists(srcAspNet))
+                // 1. Copy the dotnet host binary.
+                var dotnetExeName = GetDotnetExecutableName();
+                var srcDotnet = Path.Combine(globalDotnetHome, dotnetExeName);
+                if (File.Exists(srcDotnet))
                 {
-                    CopyDirectory(srcAspNet, dstAspNet);
-                }
-            }
-
-            if (flavor == BuildCacheFlavor.AspNetCore)
-            {
-                // 5a. Place the ASP.NET Core shared framework DIRECTLY from the BCS pack. The aspnetcore
-                //     artifact is the runtime-pack nupkg stored verbatim, so its bare runtimes/{rid}/lib/
-                //     net{X}.0/ already carries the managed assemblies AND the host-resolvable
-                //     Microsoft.AspNetCore.App.deps.json + runtimeconfig.json. We build the framework
-                //     folder entirely from that (no feed clone) and synthesize .version; the base runtime
-                //     + host stay feed-cloned (steps 1-3) since the aspnetcore pack ships neither. Fails
-                //     loud if the placed framework is incomplete.
-                try
-                {
-                    PlaceAspNetFrameworkFromPack(extractDir, dstAspNet, rid, aspNetCoreVersion, commitSha);
-                }
-                catch
-                {
-                    try { Directory.Delete(bcsHomeRoot, recursive: true); } catch { }
-                    throw;
+                    var dstDotnet = Path.Combine(bcsHomeRoot, dotnetExeName);
+                    File.Copy(srcDotnet, dstDotnet, overwrite: true);
+                    EnsureExecutable(dstDotnet);
                 }
 
-                Log.Info($"Build Cache: Per-job dotnet home built at {bcsHomeRoot} (Microsoft.AspNetCore.App placed directly from BCS commit {ShortSha(commitSha)})");
-                return bcsHomeRoot;
+                // 2. Mirror host/fxr/{runtimeVersion} (small dir, ~1 file).
+                var srcHostFxr = Path.Combine(globalDotnetHome, "host", "fxr", runtimeVersion);
+                var dstHostFxr = Path.Combine(bcsHomeRoot, "host", "fxr", runtimeVersion);
+                if (Directory.Exists(srcHostFxr))
+                {
+                    CopyDirectory(srcHostFxr, dstHostFxr);
+                }
+
+                // 3. Mirror shared/Microsoft.NETCore.App/{runtimeVersion} (feed clone; BCS runtime bits
+                //    are overlaid on top below when a runtime extract is supplied).
+                var srcNetCoreApp = Path.Combine(globalDotnetHome, "shared", "Microsoft.NETCore.App", runtimeVersion);
+                var dstNetCoreApp = Path.Combine(bcsHomeRoot, "shared", "Microsoft.NETCore.App", runtimeVersion);
+                if (Directory.Exists(srcNetCoreApp))
+                {
+                    CopyDirectory(srcNetCoreApp, dstNetCoreApp);
+                }
+
+                // 4. Overlay the BCS base runtime (Microsoft.NETCore.App) + host onto the feed clone.
+                if (!string.IsNullOrEmpty(runtimeExtractDir))
+                {
+                    OverlayRuntimeIntoHome(
+                        runtimeExtractDir, bcsHomeRoot, dstNetCoreApp, dstHostFxr, dotnetExeName,
+                        runtimeVersion, runtimeCommitSha, runtimeConfig);
+                }
+
+                // 5. Place / clone the ASP.NET Core shared framework (Microsoft.AspNetCore.App).
+                if (!string.IsNullOrEmpty(aspNetCoreVersion))
+                {
+                    var dstAspNet = Path.Combine(bcsHomeRoot, "shared", "Microsoft.AspNetCore.App", aspNetCoreVersion);
+
+                    if (!string.IsNullOrEmpty(aspNetCoreExtractDir))
+                    {
+                        // Place DIRECTLY from the BCS pack (no feed clone) so no feed assembly can leak
+                        // into the framework that actually runs. Fails loud if the pack is incomplete.
+                        var aspNetConfigResolved = ResolveBuildCacheConfig(aspNetCoreConfig, BuildCacheFlavor.AspNetCore);
+                        var aspNetRid = GetRidForConfig(aspNetConfigResolved);
+                        PlaceAspNetFrameworkFromPack(aspNetCoreExtractDir, dstAspNet, aspNetRid, aspNetCoreVersion, aspNetCoreCommitSha);
+                    }
+                    else
+                    {
+                        // Non-overridden framework: clone the feed copy.
+                        var srcAspNet = Path.Combine(globalDotnetHome, "shared", "Microsoft.AspNetCore.App", aspNetCoreVersion);
+                        if (Directory.Exists(srcAspNet))
+                        {
+                            CopyDirectory(srcAspNet, dstAspNet);
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                try { Directory.Delete(bcsHomeRoot, recursive: true); } catch { }
+                throw;
             }
 
-            // ===== Runtime flavour: overlay BCS bits onto the feed-cloned base runtime. =====
+            Log.Info(
+                $"Build Cache: Per-job dotnet home built at {bcsHomeRoot} " +
+                $"(runtime {(string.IsNullOrEmpty(runtimeCommitSha) ? "feed" : ShortSha(runtimeCommitSha))}, " +
+                $"aspnetcore {(string.IsNullOrEmpty(aspNetCoreCommitSha) ? "feed" : ShortSha(aspNetCoreCommitSha))})");
+            return bcsHomeRoot;
+        }
+
+        /// <summary>
+        /// Overlays the BCS base runtime (Microsoft.NETCore.App) managed + native binaries and host
+        /// (hostpolicy/hostfxr/dotnet) onto an already-feed-cloned per-job home. Rewrites the overlaid
+        /// runtime's .version to carry the BCS commit. Throws (loud) if the overlay copies 0 files.
+        /// </summary>
+        private static void OverlayRuntimeIntoHome(
+            string extractDir, string bcsHomeRoot, string dstNetCoreApp, string dstHostFxr,
+            string dotnetExeName, string runtimeVersion, string commitSha, string buildCacheConfig)
+        {
+            buildCacheConfig = ResolveBuildCacheConfig(buildCacheConfig, BuildCacheFlavor.Runtime);
+            var rid = GetRidForConfig(buildCacheConfig);
             int filesOverlaid = 0;
 
+            // Overlay BCS managed + native into the per-job NETCore.App.
+            var nugetPackageDir = FindDirectory(extractDir, $"microsoft.netcore.app.runtime.{rid}");
+            if (nugetPackageDir != null)
             {
-                // 5. Overlay BCS managed + native into the per-job NETCore.App.
-                var nugetPackageDir = FindDirectory(extractDir, $"microsoft.netcore.app.runtime.{rid}");
-                if (nugetPackageDir != null)
+                var runtimesDir = Path.Combine(nugetPackageDir, "Release", "runtimes", rid);
+                if (Directory.Exists(runtimesDir))
                 {
-                    var runtimesDir = Path.Combine(nugetPackageDir, "Release", "runtimes", rid);
-                    if (Directory.Exists(runtimesDir))
-                    {
-                        filesOverlaid += CopyManaged(runtimesDir, dstNetCoreApp);
-                        filesOverlaid += CopyNative(runtimesDir, dstNetCoreApp);
-                    }
+                    filesOverlaid += CopyManaged(runtimesDir, dstNetCoreApp);
+                    filesOverlaid += CopyNative(runtimesDir, dstNetCoreApp);
+                }
+            }
+
+            // Overlay BCS host binaries.
+            var corehostDir = FindCorehostDirectory(extractDir, rid);
+            if (corehostDir != null)
+            {
+                filesOverlaid += CopyHostBinaryIfPresent(corehostDir, dstNetCoreApp, GetNativeLibName("hostpolicy"));
+
+                if (Directory.Exists(dstHostFxr))
+                {
+                    filesOverlaid += CopyHostBinaryIfPresent(corehostDir, dstHostFxr, GetNativeLibName("hostfxr"));
                 }
 
-                // 6. Overlay BCS host binaries.
-                var corehostDir = FindCorehostDirectory(extractDir, rid);
-                if (corehostDir != null)
+                var dstDotnetHost = Path.Combine(bcsHomeRoot, dotnetExeName);
+                var copied = CopyHostBinaryIfPresent(corehostDir, bcsHomeRoot, dotnetExeName);
+                if (copied > 0)
                 {
-                    filesOverlaid += CopyHostBinaryIfPresent(corehostDir, dstNetCoreApp, GetNativeLibName("hostpolicy"));
-
-                    if (Directory.Exists(dstHostFxr))
-                    {
-                        filesOverlaid += CopyHostBinaryIfPresent(corehostDir, dstHostFxr, GetNativeLibName("hostfxr"));
-                    }
-
-                    var dstDotnetHost = Path.Combine(bcsHomeRoot, dotnetExeName);
-                    var copied = CopyHostBinaryIfPresent(corehostDir, bcsHomeRoot, dotnetExeName);
-                    if (copied > 0)
-                    {
-                        EnsureExecutable(dstDotnetHost);
-                    }
-                    filesOverlaid += copied;
+                    EnsureExecutable(dstDotnetHost);
                 }
+                filesOverlaid += copied;
             }
 
             if (filesOverlaid == 0)
             {
-                // The per-job home would be just a copy of the feed runtime with no BCS bits.
-                // Tear it down and let the caller fail the job loudly.
-                try { Directory.Delete(bcsHomeRoot, recursive: true); } catch { }
                 throw new InvalidOperationException(
-                    $"Build Cache: overlay copied 0 files for commit {ShortSha(commitSha)} (config '{buildCacheConfig}', rid '{rid}', repo '{flavor}'). " +
+                    $"Build Cache: runtime overlay copied 0 files for commit {ShortSha(commitSha)} (config '{buildCacheConfig}', rid '{rid}'). " +
                     "The archive layout may have changed or the platform is not supported.");
             }
 
-            // 7. Rewrite the overlaid runtime's .version so any consumer (the agent's own version
-            //    measurement, GetDependencies, etc.) reports the BCS commit.
+            // Rewrite the overlaid runtime's .version so any consumer (the agent's own version
+            // measurement, GetDependencies, etc.) reports the BCS commit.
             File.WriteAllText(
                 Path.Combine(dstNetCoreApp, ".version"),
                 $"{commitSha}\n{runtimeVersion}\n");
-
-            Log.Info($"Build Cache: Per-job dotnet home built at {bcsHomeRoot} ({filesOverlaid} BCS files overlaid)");
-            return bcsHomeRoot;
         }
 
         /// <summary>
