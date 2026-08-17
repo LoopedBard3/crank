@@ -344,11 +344,327 @@ namespace Microsoft.Crank.Agent
                 homeTagSha = ShortSha(aspNetCoreCommitSha);
             }
 
-            // Per-job, never reused across jobs to avoid pollution.
+            // Per-job, never reused across jobs to avoid pollution. (Persistent, reuse-aware homes go
+            // through EnsureBuildCacheDotnetHome instead; this overload keeps the historical throwaway
+            // semantics for direct callers and unit tests.)
             var bcsHomeRoot = Path.Combine(
                 Path.GetTempPath(),
                 "crank-buildcache",
                 $"home-{homeTagSha}-{Guid.NewGuid():N}");
+
+            BuildDotnetHomeInto(
+                bcsHomeRoot, globalDotnetHome, runtimeVersion, aspNetCoreVersion,
+                runtimeExtractDir, runtimeCommitSha, runtimeConfig,
+                aspNetCoreExtractDir, aspNetCoreCommitSha, aspNetCoreConfig);
+
+            Log.Info(
+                $"Build Cache: Per-job dotnet home built at {bcsHomeRoot} " +
+                $"(runtime {(string.IsNullOrEmpty(runtimeCommitSha) ? "feed" : ShortSha(runtimeCommitSha))}, " +
+                $"aspnetcore {(string.IsNullOrEmpty(aspNetCoreCommitSha) ? "feed" : ShortSha(aspNetCoreCommitSha))})");
+            return bcsHomeRoot;
+        }
+
+        // Root for persistent, SHA-keyed dotnet homes. Unlike the per-job throwaway home above, these
+        // survive job cleanup and are reused across reuseBuild runs so a framework-dependent reused build
+        // reliably runs the exact BCS bits it resolved (rather than silently falling back to the feed
+        // runtime once the per-job home is deleted). Homes are keyed by the CONCRETE resolved commit shas
+        // (never the literal "latest"), so when "latest" advances a reused job re-resolves to the new sha,
+        // gets a new key, and materializes the newer bits instead of freezing the first build.
+        private static string HomesRoot => Path.Combine(Path.GetTempPath(), "crank-buildcache", "homes");
+
+        private const string HomeMarkerFileName = "bcs-home.json";
+
+        // How many persistent homes to keep before evicting the least-recently-used. Homes are a few
+        // hundred MB each; 8 covers a handful of concurrently-bisected commits without unbounded growth.
+        private const int MaxPersistentHomes = 8;
+
+        /// <summary>
+        /// Computes a stable cache key for a persistent dotnet home from the CONCRETE resolved inputs.
+        /// Empty shas collapse to "feed" so a pure-feed home (no BCS override on that side) is still keyed
+        /// deterministically. The literal string "latest" never appears in the key or path.
+        /// </summary>
+        internal static string ComputeHomeCacheKey(
+            string runtimeCommitSha,
+            string aspNetCoreCommitSha,
+            string runtimeVersion,
+            string aspNetCoreVersion,
+            string rid)
+        {
+            string ShaOrFeed(string s) => string.IsNullOrEmpty(s) ? "feed" : ShortSha(s);
+
+            return string.Join("-", new[]
+            {
+                "rt", ShaOrFeed(runtimeCommitSha),
+                "asp", ShaOrFeed(aspNetCoreCommitSha),
+                "rtv", SanitizeForPath(runtimeVersion),
+                "aspv", SanitizeForPath(aspNetCoreVersion),
+                SanitizeForPath(rid),
+            });
+        }
+
+        /// <summary>
+        /// Returns true and the home path if a valid persistent home already exists for <paramref name="key"/>.
+        /// Touches the directory so least-recently-used eviction keeps warm homes.
+        /// </summary>
+        internal static bool TryGetCachedDotnetHome(string key, out string homePath)
+        {
+            homePath = Path.Combine(HomesRoot, key);
+            var marker = Path.Combine(homePath, HomeMarkerFileName);
+            if (Directory.Exists(homePath) && File.Exists(marker))
+            {
+                TouchDirectory(homePath);
+                return true;
+            }
+
+            homePath = null;
+            return false;
+        }
+
+        /// <summary>
+        /// Returns a persistent, SHA-keyed dotnet home for the given resolved inputs, materializing it on a
+        /// cache miss. Materialization is atomic (build into a temp dir, then <see cref="Directory.Move"/> into
+        /// place) and idempotent under concurrent jobs. Pass <paramref name="baseDotnetHome"/> = the global feed
+        /// home for a fresh build, or a previously-materialized home (e.g. the first build's home) when only one
+        /// framework drifted on reuse — the non-drifted side is cloned from that base while the drifted side
+        /// (whose extract dir is supplied) is overlaid/placed from its new BCS bits.
+        /// </summary>
+        public static string EnsureBuildCacheDotnetHome(
+            string baseDotnetHome,
+            string runtimeVersion,
+            string aspNetCoreVersion,
+            string runtimeExtractDir,
+            string runtimeCommitSha,
+            string runtimeConfig,
+            string aspNetCoreExtractDir,
+            string aspNetCoreCommitSha,
+            string aspNetCoreConfig,
+            string rid)
+        {
+            var key = ComputeHomeCacheKey(runtimeCommitSha, aspNetCoreCommitSha, runtimeVersion, aspNetCoreVersion, rid);
+
+            Directory.CreateDirectory(HomesRoot);
+
+            if (TryGetCachedDotnetHome(key, out var cached))
+            {
+                Log.Info($"Build Cache: Reusing persistent dotnet home {cached} (key '{key}').");
+                return cached;
+            }
+
+            var finalPath = Path.Combine(HomesRoot, key);
+            var tmpPath = Path.Combine(HomesRoot, $"{key}.tmp-{Guid.NewGuid():N}");
+
+            try
+            {
+                BuildDotnetHomeInto(
+                    tmpPath, baseDotnetHome, runtimeVersion, aspNetCoreVersion,
+                    runtimeExtractDir, runtimeCommitSha, runtimeConfig,
+                    aspNetCoreExtractDir, aspNetCoreCommitSha, aspNetCoreConfig);
+
+                WriteHomeMarker(tmpPath, key, runtimeVersion, aspNetCoreVersion, runtimeCommitSha, aspNetCoreCommitSha);
+
+                try
+                {
+                    Directory.Move(tmpPath, finalPath);
+                }
+                catch (IOException)
+                {
+                    // Another job materialized the same key concurrently. Prefer the existing home and
+                    // discard our temp copy rather than failing the build.
+                    if (Directory.Exists(finalPath))
+                    {
+                        TryDeleteDirectory(tmpPath);
+                    }
+                    else
+                    {
+                        throw;
+                    }
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    if (Directory.Exists(finalPath))
+                    {
+                        TryDeleteDirectory(tmpPath);
+                    }
+                    else
+                    {
+                        throw;
+                    }
+                }
+            }
+            catch
+            {
+                TryDeleteDirectory(tmpPath);
+                throw;
+            }
+
+            TouchDirectory(finalPath);
+            EvictOldHomes(MaxPersistentHomes, keep: finalPath);
+
+            Log.Info(
+                $"Build Cache: Persistent dotnet home materialized at {finalPath} " +
+                $"(runtime {(string.IsNullOrEmpty(runtimeCommitSha) ? "feed" : ShortSha(runtimeCommitSha))}, " +
+                $"aspnetcore {(string.IsNullOrEmpty(aspNetCoreCommitSha) ? "feed" : ShortSha(aspNetCoreCommitSha))}, key '{key}').");
+            return finalPath;
+        }
+
+        private static void WriteHomeMarker(
+            string homePath, string key, string runtimeVersion, string aspNetCoreVersion,
+            string runtimeCommitSha, string aspNetCoreCommitSha)
+        {
+            var marker = new HomeMarker
+            {
+                Key = key,
+                RuntimeVersion = runtimeVersion,
+                AspNetCoreVersion = aspNetCoreVersion,
+                RuntimeCommitSha = runtimeCommitSha ?? string.Empty,
+                AspNetCoreCommitSha = aspNetCoreCommitSha ?? string.Empty,
+                CreatedUtc = DateTime.UtcNow,
+            };
+
+            File.WriteAllText(
+                Path.Combine(homePath, HomeMarkerFileName),
+                JsonSerializer.Serialize(marker));
+        }
+
+        /// <summary>
+        /// Evicts the least-recently-used persistent homes, keeping at most <paramref name="max"/>. The
+        /// directory named by <paramref name="keep"/> (the one just materialized/attached) is never evicted.
+        /// Best-effort: a home currently in use by another job that resists deletion is simply skipped.
+        /// </summary>
+        private static void EvictOldHomes(int max, string keep)
+        {
+            try
+            {
+                var root = new DirectoryInfo(HomesRoot);
+                if (!root.Exists)
+                {
+                    return;
+                }
+
+                var keepFull = keep == null ? null : Path.GetFullPath(keep);
+
+                var homes = root.GetDirectories()
+                    // Ignore in-flight temp dirs from concurrent materializations.
+                    .Where(d => !d.Name.Contains(".tmp-"))
+                    .OrderByDescending(d => d.LastWriteTimeUtc)
+                    .ToList();
+
+                foreach (var dir in homes.Skip(max))
+                {
+                    if (keepFull != null && string.Equals(Path.GetFullPath(dir.FullName), keepFull, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    if (TryDeleteDirectory(dir.FullName))
+                    {
+                        Log.Info($"Build Cache: Evicted persistent dotnet home {dir.FullName} (LRU, keeping {max}).");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Info($"Build Cache: persistent-home eviction skipped: {ex.Message}");
+            }
+        }
+
+        private static void TouchDirectory(string path)
+        {
+            try
+            {
+                if (Directory.Exists(path))
+                {
+                    Directory.SetLastWriteTimeUtc(path, DateTime.UtcNow);
+                }
+            }
+            catch
+            {
+                // Touch is a best-effort LRU hint; never fail a build over it.
+            }
+        }
+
+        private static bool TryDeleteDirectory(string path)
+        {
+            try
+            {
+                if (Directory.Exists(path))
+                {
+                    Directory.Delete(path, recursive: true);
+                }
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        // Persisted next to every reusable build folder (keyed by Job.BuildKey). On a reuseBuild cache hit
+        // the agent reads this to re-resolve the BCS commits, recompute the home key, and re-attach (or
+        // re-materialize on "latest" drift) the correct BCS bits without republishing the app.
+        public static bool TryReadBuildMeta(string path, out BuildCacheBuildMeta meta)
+        {
+            meta = null;
+            try
+            {
+                if (!File.Exists(path))
+                {
+                    return false;
+                }
+
+                meta = JsonSerializer.Deserialize<BuildCacheBuildMeta>(File.ReadAllText(path));
+                return meta != null;
+            }
+            catch
+            {
+                meta = null;
+                return false;
+            }
+        }
+
+        public static void WriteBuildMeta(string path, BuildCacheBuildMeta meta)
+        {
+            File.WriteAllText(path, JsonSerializer.Serialize(meta));
+        }
+
+        private class HomeMarker
+        {
+            public string Key { get; set; }
+            public string RuntimeVersion { get; set; }
+            public string AspNetCoreVersion { get; set; }
+            public string RuntimeCommitSha { get; set; }
+            public string AspNetCoreCommitSha { get; set; }
+            public DateTime CreatedUtc { get; set; }
+        }
+
+        /// <summary>
+        /// Reuse metadata persisted next to a reusable build folder (Job.BuildKey). Captures the concrete
+        /// feed-resolved framework versions, the target RID, whether the publish was self-contained, and the
+        /// BCS commit shas resolved at first build — everything needed to re-attach or refresh BCS bits on a
+        /// reuseBuild cache hit without re-publishing the app.
+        /// </summary>
+        public class BuildCacheBuildMeta
+        {
+            public string RuntimeVersion { get; set; }
+            public string AspNetCoreVersion { get; set; }
+            public string Rid { get; set; }
+            public bool SelfContained { get; set; }
+            public string RuntimeCommitSha { get; set; }
+            public string AspNetCoreCommitSha { get; set; }
+        }
+
+        private static void BuildDotnetHomeInto(
+            string bcsHomeRoot,
+            string globalDotnetHome,
+            string runtimeVersion,
+            string aspNetCoreVersion,
+            string runtimeExtractDir,
+            string runtimeCommitSha,
+            string runtimeConfig,
+            string aspNetCoreExtractDir,
+            string aspNetCoreCommitSha,
+            string aspNetCoreConfig)
+        {
             Directory.CreateDirectory(bcsHomeRoot);
 
             try
@@ -417,12 +733,6 @@ namespace Microsoft.Crank.Agent
                 try { Directory.Delete(bcsHomeRoot, recursive: true); } catch { }
                 throw;
             }
-
-            Log.Info(
-                $"Build Cache: Per-job dotnet home built at {bcsHomeRoot} " +
-                $"(runtime {(string.IsNullOrEmpty(runtimeCommitSha) ? "feed" : ShortSha(runtimeCommitSha))}, " +
-                $"aspnetcore {(string.IsNullOrEmpty(aspNetCoreCommitSha) ? "feed" : ShortSha(aspNetCoreCommitSha))})");
-            return bcsHomeRoot;
         }
 
         /// <summary>
@@ -436,7 +746,15 @@ namespace Microsoft.Crank.Agent
         {
             buildCacheConfig = ResolveBuildCacheConfig(buildCacheConfig, BuildCacheFlavor.Runtime);
             var rid = GetRidForConfig(buildCacheConfig);
-            int filesOverlaid = 0;
+
+            // Track each category of the runtime overlay separately. Checking only an aggregate count
+            // lets a partial/corrupt archive (e.g. host layout discovered but managed/native missing)
+            // pass and rewrite .version, silently running a mix of BCS host + feed managed/native bits.
+            // The managed assemblies and native runtime libraries are the load-bearing shared-framework
+            // payload, so require BOTH before we stamp .version.
+            int managedOverlaid = 0;
+            int nativeOverlaid = 0;
+            int hostOverlaid = 0;
 
             // Overlay BCS managed + native into the per-job NETCore.App.
             var nugetPackageDir = FindDirectory(extractDir, $"microsoft.netcore.app.runtime.{rid}");
@@ -445,20 +763,22 @@ namespace Microsoft.Crank.Agent
                 var runtimesDir = Path.Combine(nugetPackageDir, "Release", "runtimes", rid);
                 if (Directory.Exists(runtimesDir))
                 {
-                    filesOverlaid += CopyManaged(runtimesDir, dstNetCoreApp);
-                    filesOverlaid += CopyNative(runtimesDir, dstNetCoreApp);
+                    managedOverlaid += CopyManaged(runtimesDir, dstNetCoreApp);
+                    nativeOverlaid += CopyNative(runtimesDir, dstNetCoreApp);
                 }
             }
 
-            // Overlay BCS host binaries.
+            // Overlay BCS host binaries. Host is best-effort: the per-job home was cloned from the feed
+            // install (steps 1-2 of the home build), so hostfxr/hostpolicy/muxer already exist there; the
+            // BCS host overlay only refines them when the archive ships a corehost dir.
             var corehostDir = FindCorehostDirectory(extractDir, rid);
             if (corehostDir != null)
             {
-                filesOverlaid += CopyHostBinaryIfPresent(corehostDir, dstNetCoreApp, GetNativeLibName("hostpolicy"));
+                hostOverlaid += CopyHostBinaryIfPresent(corehostDir, dstNetCoreApp, GetNativeLibName("hostpolicy"));
 
                 if (Directory.Exists(dstHostFxr))
                 {
-                    filesOverlaid += CopyHostBinaryIfPresent(corehostDir, dstHostFxr, GetNativeLibName("hostfxr"));
+                    hostOverlaid += CopyHostBinaryIfPresent(corehostDir, dstHostFxr, GetNativeLibName("hostfxr"));
                 }
 
                 var dstDotnetHost = Path.Combine(bcsHomeRoot, dotnetExeName);
@@ -467,14 +787,20 @@ namespace Microsoft.Crank.Agent
                 {
                     EnsureExecutable(dstDotnetHost);
                 }
-                filesOverlaid += copied;
+                hostOverlaid += copied;
             }
 
-            if (filesOverlaid == 0)
+            if (managedOverlaid == 0 || nativeOverlaid == 0)
             {
                 throw new InvalidOperationException(
-                    $"Build Cache: runtime overlay copied 0 files for commit {ShortSha(commitSha)} (config '{buildCacheConfig}', rid '{rid}'). " +
-                    "The archive layout may have changed or the platform is not supported.");
+                    $"Build Cache: runtime overlay is incomplete for commit {ShortSha(commitSha)} (config '{buildCacheConfig}', rid '{rid}'): " +
+                    $"copied {managedOverlaid} managed assemblies, {nativeOverlaid} native libraries, {hostOverlaid} host binaries. " +
+                    "Both managed and native runtime bits are required. The archive layout may have changed or the platform is not supported.");
+            }
+
+            if (hostOverlaid == 0)
+            {
+                Log.Info($"Build Cache: runtime overlay for commit {ShortSha(commitSha)} copied no host binaries (rid '{rid}'); using the feed-cloned host.");
             }
 
             // Rewrite the overlaid runtime's .version so any consumer (the agent's own version
@@ -1122,7 +1448,10 @@ namespace Microsoft.Crank.Agent
                 return RuntimeInformation.ProcessArchitecture switch
                 {
                     Architecture.Arm64 => "win-arm64",
-                    Architecture.X86 => "win-x86",
+                    // Map x86 processes to win-x64 to match Startup.GetPlatformMoniker (the publish RID).
+                    // A single shared RID keeps BCS archive selection aligned with the published output so
+                    // we never overlay win-x86 BCS bits onto a win-x64 publish (or vice versa).
+                    Architecture.X86 => "win-x64",
                     _ => "win-x64",
                 };
             }

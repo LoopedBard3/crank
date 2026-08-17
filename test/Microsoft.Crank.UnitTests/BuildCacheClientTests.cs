@@ -431,7 +431,8 @@ namespace Microsoft.Crank.UnitTests
                     extractDir, "abcdef0123456789", null,
                     null, null, null));
 
-            Assert.Contains("0 files", ex.Message);
+            // Message now reports per-category counts (managed / native / host) instead of an aggregate.
+            Assert.Contains("0 managed assemblies", ex.Message);
         }
 
         [Fact]
@@ -475,6 +476,103 @@ namespace Microsoft.Crank.UnitTests
             {
                 try { Directory.Delete(home1, recursive: true); } catch { }
                 try { Directory.Delete(home2, recursive: true); } catch { }
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // Persistent SHA-keyed dotnet home (reuse-aware) — ComputeHomeCacheKey +
+        // EnsureBuildCacheDotnetHome cache hit / miss. Backs the build-reuse fix so a
+        // framework-dependent reused build re-attaches the exact BCS bits it resolved.
+        // -------------------------------------------------------------------
+
+        [Fact]
+        public void ComputeHomeCacheKey_IsDeterministic_AndNeverContainsLatest()
+        {
+            var k1 = BuildCacheClient.ComputeHomeCacheKey("1111aaaa2222bbbb", "3333cccc4444dddd", "11.0.0-ci", "11.0.0-ci", "win-x64");
+            var k2 = BuildCacheClient.ComputeHomeCacheKey("1111aaaa2222bbbb", "3333cccc4444dddd", "11.0.0-ci", "11.0.0-ci", "win-x64");
+
+            Assert.Equal(k1, k2);
+            Assert.DoesNotContain("latest", k1);
+
+            // A different runtime sha must yield a different key so an advanced "latest" doesn't collide.
+            var k3 = BuildCacheClient.ComputeHomeCacheKey("9999ffff8888eeee", "3333cccc4444dddd", "11.0.0-ci", "11.0.0-ci", "win-x64");
+            Assert.NotEqual(k1, k3);
+
+            // Empty shas collapse to a deterministic "feed" token (still no literal "latest").
+            var kFeed = BuildCacheClient.ComputeHomeCacheKey("", "", "11.0.0-ci", "11.0.0-ci", "win-x64");
+            Assert.Contains("feed", kFeed);
+            Assert.DoesNotContain("latest", kFeed);
+        }
+
+        [Fact]
+        public void EnsureBuildCacheDotnetHome_CacheHit_ReturnsSamePersistentHome()
+        {
+            var rid = BuildCacheClient.GetPlatformMoniker();
+            var configKey = ConfigKeyForRid(rid);
+            var (extractDir, _, _, _) = BuildFakeBcsArchive(rid, includeHost: true, includeApphost: false);
+
+            // Unique versions so this test's persistent home can't collide with other tests' homes.
+            var version = "11.0.0-ehit-" + Guid.NewGuid().ToString("N").Substring(0, 8);
+            var globalHome = BuildFakeGlobalDotnetHome(version, version);
+            var sha = "abcdef0123456789abcdef0123456789abcdef01";
+
+            string home1 = null;
+            try
+            {
+                home1 = BuildCacheClient.EnsureBuildCacheDotnetHome(
+                    globalHome, version, version, extractDir, sha, configKey, null, null, null, rid);
+
+                Assert.True(Directory.Exists(home1));
+
+                // The materialized home is discoverable by its computed key (aspnet side is feed => "feed").
+                var key = BuildCacheClient.ComputeHomeCacheKey(sha, null, version, version, rid);
+                Assert.True(BuildCacheClient.TryGetCachedDotnetHome(key, out var cached));
+                Assert.Equal(home1, cached);
+
+                // A second call with identical inputs is a cache hit: same home, no new directory.
+                var home2 = BuildCacheClient.EnsureBuildCacheDotnetHome(
+                    globalHome, version, version, extractDir, sha, configKey, null, null, null, rid);
+                Assert.Equal(home1, home2);
+            }
+            finally
+            {
+                if (home1 != null) { try { Directory.Delete(home1, recursive: true); } catch { } }
+            }
+        }
+
+        [Fact]
+        public void EnsureBuildCacheDotnetHome_DifferentRuntimeSha_MaterializesDistinctHome()
+        {
+            var rid = BuildCacheClient.GetPlatformMoniker();
+            var configKey = ConfigKeyForRid(rid);
+            var (extractA, _, _, _) = BuildFakeBcsArchive(rid, includeHost: true, includeApphost: false);
+            var (extractB, _, _, _) = BuildFakeBcsArchive(rid, includeHost: true, includeApphost: false);
+
+            var version = "11.0.0-edrift-" + Guid.NewGuid().ToString("N").Substring(0, 8);
+            var globalHome = BuildFakeGlobalDotnetHome(version, version);
+            var shaA = "1111aaaa2222bbbb3333cccc4444dddd55556666";
+            var shaB = "6666eeee7777ffff8888aaaa9999bbbbccccdddd";
+
+            string homeA = null, homeB = null;
+            try
+            {
+                homeA = BuildCacheClient.EnsureBuildCacheDotnetHome(
+                    globalHome, version, version, extractA, shaA, configKey, null, null, null, rid);
+                homeB = BuildCacheClient.EnsureBuildCacheDotnetHome(
+                    globalHome, version, version, extractB, shaB, configKey, null, null, null, rid);
+
+                // Different shas => different keys => different homes carrying their own BCS commit.
+                Assert.NotEqual(homeA, homeB);
+
+                var vA = File.ReadAllText(Path.Combine(homeA, "shared", "Microsoft.NETCore.App", version, ".version"));
+                var vB = File.ReadAllText(Path.Combine(homeB, "shared", "Microsoft.NETCore.App", version, ".version"));
+                Assert.Contains(shaA, vA);
+                Assert.Contains(shaB, vB);
+            }
+            finally
+            {
+                if (homeA != null) { try { Directory.Delete(homeA, recursive: true); } catch { } }
+                if (homeB != null) { try { Directory.Delete(homeB, recursive: true); } catch { } }
             }
         }
 
