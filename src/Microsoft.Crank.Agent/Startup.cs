@@ -3239,26 +3239,6 @@ namespace Microsoft.Crank.Agent
                     return null;
                 }
 
-                // On the buildcache channel the base shared-framework FOLDER is always resolved to the
-                // latest feed version (the BCS bits are overlaid/placed on top of it), so a user-pinned
-                // runtime/aspnetcore VERSION would be silently ignored. That is misleading for bisection,
-                // where pinning is expressed via the commit sha instead. Fail loud rather than run with an
-                // ignored version. An explicit "latest" is allowed since it matches the buildcache default.
-                static bool IsPinnedVersion(string version)
-                    => !string.IsNullOrEmpty(version) && !string.Equals(version, "latest", StringComparison.OrdinalIgnoreCase);
-
-                if (IsPinnedVersion(job.RuntimeVersion))
-                {
-                    job.Error = $"Build Cache: 'runtimeVersion' ('{job.RuntimeVersion}') cannot be combined with '--application.channel buildcache'. The base runtime folder is always the latest feed version and BCS bits are overlaid on top; pin/bisect the runtime via 'buildCacheRuntimeCommitSha' instead (leave 'runtimeVersion' empty or 'latest').";
-                    return null;
-                }
-
-                if (IsPinnedVersion(job.AspNetCoreVersion))
-                {
-                    job.Error = $"Build Cache: 'aspNetCoreVersion' ('{job.AspNetCoreVersion}') cannot be combined with '--application.channel buildcache'. The ASP.NET Core shared framework is always placed from BCS onto the latest feed folder; pin/bisect it via 'buildCacheAspNetCoreCommitSha' instead (leave 'aspNetCoreVersion' empty or 'latest').";
-                    return null;
-                }
-
                 try
                 {
                     // Resolve BOTH repos' commits + configs first (cheap JSON lookups). The heavy archive
