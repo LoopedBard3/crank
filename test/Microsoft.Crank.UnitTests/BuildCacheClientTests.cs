@@ -145,6 +145,72 @@ namespace Microsoft.Crank.UnitTests
         }
 
         // -------------------------------------------------------------------
+        // IsCommitSha
+        // -------------------------------------------------------------------
+
+        [Theory]
+        [InlineData("abcdef12", true)] // min length
+        [InlineData("ABCDEF12", true)] // upper hex
+        [InlineData("603403d9cb49d3d1c35b56bcff024ce99a8c5c3a", true)] // full 40
+        [InlineData("", false)]
+        [InlineData(null, false)]
+        [InlineData("abc", false)] // too short
+        [InlineData("11.0.0-preview.1.24081.5", false)] // feed version string (non-hex, has dots/dashes)
+        [InlineData("latest", false)] // sentinel, not a sha
+        [InlineData("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false)] // 41 chars, too long
+        public void IsCommitSha_ClassifiesValues(string value, bool expected)
+        {
+            Assert.Equal(expected, BuildCacheClient.IsCommitSha(value));
+        }
+
+        // -------------------------------------------------------------------
+        // TryResolveCiVersionPin
+        // -------------------------------------------------------------------
+
+        [Theory]
+        [InlineData("")]
+        [InlineData(null)]
+        [InlineData("latest")]
+        [InlineData("LATEST")] // case-insensitive
+        public void TryResolveCiVersionPin_EmptyOrLatest_ResolvesToLatest(string value)
+        {
+            var ok = BuildCacheClient.TryResolveCiVersionPin(value, "runtimeVersion", out var pin, out var error);
+
+            Assert.True(ok);
+            Assert.Equal("", pin);
+            Assert.Null(error);
+        }
+
+        [Theory]
+        [InlineData("abcdef12")] // min length
+        [InlineData("ABCDEF12")] // upper hex
+        [InlineData("603403d9cb49d3d1c35b56bcff024ce99a8c5c3a")] // full 40
+        public void TryResolveCiVersionPin_CommitSha_ReturnsPin(string sha)
+        {
+            var ok = BuildCacheClient.TryResolveCiVersionPin(sha, "runtimeVersion", out var pin, out var error);
+
+            Assert.True(ok);
+            Assert.Equal(sha, pin);
+            Assert.Null(error);
+        }
+
+        [Theory]
+        [InlineData("11.0.0-preview.1.24081.5")] // feed version string
+        [InlineData("10.0.0")] // release version string
+        [InlineData("abc")] // too short to be a sha
+        [InlineData("ghijklmn")] // non-hex
+        public void TryResolveCiVersionPin_VersionString_FailsWithError(string value)
+        {
+            var ok = BuildCacheClient.TryResolveCiVersionPin(value, "aspNetCoreVersion", out var pin, out var error);
+
+            Assert.False(ok);
+            Assert.Equal("", pin);
+            Assert.NotNull(error);
+            Assert.Contains("aspNetCoreVersion", error); // names the offending argument
+            Assert.Contains("ci", error); // mentions the channel
+        }
+
+        // -------------------------------------------------------------------
         // ShortSha
         // -------------------------------------------------------------------
 

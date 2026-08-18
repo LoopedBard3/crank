@@ -71,16 +71,14 @@ namespace Microsoft.Crank.Models
         public string UseMonoRuntime { get; set; } = "";
         public bool NoGlobalJson { get; set; }
 
-        // Build Cache Service properties for per-commit framework resolution. On the "buildcache"
-        // channel BOTH the base runtime (Microsoft.NETCore.App, from dotnet/runtime) and the ASP.NET
-        // Core shared framework (Microsoft.AspNetCore.App, from dotnet/aspnetcore) are overridden from
-        // BCS. Each repo resolves independently: an empty commit sha means "latest build on that repo's
-        // branch"; a sha pins/bisects that repo while the other stays latest. RID/config is auto-derived
-        // from the agent platform per repo.
-        public string BuildCacheRuntimeCommitSha { get; set; } = "";
-        public string BuildCacheAspNetCoreCommitSha { get; set; } = "";
-        public string BuildCacheRuntimeBranch { get; set; } = "";
-        public string BuildCacheAspNetCoreBranch { get; set; } = "";
+        // Build Cache Service property for per-commit framework resolution. On the "ci" channel BOTH the
+        // base runtime (Microsoft.NETCore.App, from dotnet/runtime) and the ASP.NET Core shared framework
+        // (Microsoft.AspNetCore.App, from dotnet/aspnetcore) are overridden from BCS. Each repo's build is
+        // selected via the existing RuntimeVersion / AspNetCoreVersion arguments, which on this channel
+        // carry a commit SHA (empty = the latest build on the branch). CiBranch selects which branch the
+        // "latest" lookup targets for both repos (default main); it is ignored when a SHA is given.
+        // RID/config is auto-derived from the agent platform per repo.
+        public string CiBranch { get; set; } = "";
 
         // Delay from the process started to the console receiving "Application started"
         public TimeSpan StartupMainMethod { get; set; }
@@ -411,10 +409,7 @@ namespace Microsoft.Crank.Models
                 DockerFile = DockerFile,
                 DockerImageName = DockerImageName,
                 DockerContextDirectory = DockerContextDirectory,
-                BuildCacheRuntimeCommitSha = BuildCacheRuntimeCommitSha,
-                BuildCacheAspNetCoreCommitSha = BuildCacheAspNetCoreCommitSha,
-                BuildCacheRuntimeBranch = BuildCacheRuntimeBranch,
-                BuildCacheAspNetCoreBranch = BuildCacheAspNetCoreBranch
+                CiBranch = CiBranch
             };
         }
 
@@ -523,9 +518,6 @@ namespace Microsoft.Crank.Models
         public string DockerFile { get; set; }
         public string DockerImageName { get; set; }
         public string DockerContextDirectory { get; set; }
-        public string BuildCacheRuntimeCommitSha { get; set; }
-        public string BuildCacheAspNetCoreCommitSha { get; set; }
-        public string BuildCacheRuntimeBranch { get; set; }
-        public string BuildCacheAspNetCoreBranch { get; set; }
+        public string CiBranch { get; set; }
     }
 }

@@ -2,7 +2,7 @@
 
 ## Context
 
-Crank (the .NET benchmarking tool) has been updated to support a new `buildcache` channel that downloads pre-built binaries from the Build Cache Service (BCS) instead of resolving versions from VMR/NuGet feeds. On this channel crank overrides **both** the base runtime (`Microsoft.NETCore.App`, from dotnet/runtime) and the ASP.NET Core shared framework (`Microsoft.AspNetCore.App`, from dotnet/aspnetcore), each resolved independently by commit. This gives per-commit granularity for performance testing and regression bisection.
+Crank (the .NET benchmarking tool) has been updated to support a new `ci` channel that downloads pre-built binaries from the Build Cache Service (BCS) instead of resolving versions from VMR/NuGet feeds. On this channel crank overrides **both** the base runtime (`Microsoft.NETCore.App`, from dotnet/runtime) and the ASP.NET Core shared framework (`Microsoft.AspNetCore.App`, from dotnet/aspnetcore), each resolved independently by commit (the commit is passed via the `runtimeVersion` / `aspNetCoreVersion` arguments). This gives per-commit granularity for performance testing and regression bisection.
 
 The crank-side changes are complete. This document describes what's needed on the BCS/dotnet-performance-infra side to make the integration work end-to-end.
 
@@ -22,7 +22,7 @@ GET https://pvscmdupload.z22.web.core.windows.net/builds/{repoName}/buildArtifac
 ```
 
 Where:
-- `repoName` = `runtime` and `aspnetcore` (both are resolved on every buildcache job; each hit uses its own repo segment)
+- `repoName` = `runtime` and `aspnetcore` (both are resolved on every `ci`-channel job; each hit uses its own repo segment)
 - `branch` = e.g., `main`, `release/10.0`
 - `configKey` = e.g., `coreclr_x64_linux`, `coreclr_arm64_windows` (runtime); `aspnetcore_x64_linux`, `aspnetcore_arm64_windows` (aspnetcore)
 - `artifactFile` = e.g., `BuildArtifacts_linux_x64_Release_coreclr.tar.gz` (runtime); `BuildArtifacts_linux_x64_Release_aspnetcore.nupkg` (aspnetcore — the verbatim runtime-pack nupkg)

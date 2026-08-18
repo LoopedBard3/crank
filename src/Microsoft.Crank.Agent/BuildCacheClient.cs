@@ -77,7 +77,7 @@ namespace Microsoft.Crank.Agent
             };
 
         /// <summary>
-        /// Which BCS repository the buildcache channel resolves from. Selects the platform→config
+        /// Which BCS repository a ci-channel resolution targets. Selects the platform→config
         /// map, the latestBuilds.json / artifact path RepoName, and the overlay target inside the
         /// dotnet home (Runtime → Microsoft.NETCore.App; AspNetCore → Microsoft.AspNetCore.App).
         /// </summary>
@@ -92,7 +92,7 @@ namespace Microsoft.Crank.Agent
         internal const string RepoNameAspNetCore = "aspnetcore";
 
         /// <summary>
-        /// Maps a BCS RepoName (the per-job <c>buildCacheRepo</c> selector) to a flavour. Anything
+        /// Maps a BCS RepoName (<c>runtime</c> / <c>aspnetcore</c> blob path segment) to a flavour. Anything
         /// other than "aspnetcore" (including empty / "runtime") resolves to <see cref="BuildCacheFlavor.Runtime"/>,
         /// preserving the proven runtime default.
         /// </summary>
@@ -155,6 +155,45 @@ namespace Microsoft.Crank.Agent
                     $"'{commitSha}' is not a valid commit SHA. Expected 8-40 hex characters.",
                     nameof(commitSha));
             }
+        }
+
+        /// <summary>
+        /// True when <paramref name="value"/> looks like a commit SHA (8-40 hex chars). A .NET feed version
+        /// string always contains non-hex characters (dots/dashes/letters beyond f), so it never collides.
+        /// </summary>
+        internal static bool IsCommitSha(string value)
+            => !string.IsNullOrEmpty(value) && _shaRegex.IsMatch(value);
+
+        /// <summary>
+        /// Interprets a "ci"-channel version argument (runtimeVersion / aspNetCoreVersion). On the ci channel
+        /// these arguments carry a Build Cache commit SHA — or empty / "latest" meaning the latest build on
+        /// the branch — rather than a feed version. The base framework FOLDER is always the latest feed
+        /// version and the BCS bits overlay onto it, so an actual version string cannot be honored here.
+        /// Returns true and sets <paramref name="commitPin"/> (empty => resolve latest) when the value is a
+        /// SHA or empty/"latest"; returns false with an explanatory <paramref name="error"/> when the value
+        /// is a version string.
+        /// </summary>
+        internal static bool TryResolveCiVersionPin(string value, string argName, out string commitPin, out string error)
+        {
+            commitPin = "";
+            error = null;
+
+            if (string.IsNullOrEmpty(value) || string.Equals(value, "latest", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            if (IsCommitSha(value))
+            {
+                commitPin = value;
+                return true;
+            }
+
+            error =
+                $"Build Cache: '{argName}' value '{value}' is not valid on the 'ci' channel. Pass a commit SHA " +
+                "(8-40 hex characters) to pin a specific build, or leave it empty to use the latest build on the " +
+                "branch. Version-string pinning is not supported on the 'ci' channel.";
+            return false;
         }
 
         /// <summary>
@@ -310,7 +349,7 @@ namespace Microsoft.Crank.Agent
         /// contribution) and fails loud if incomplete. If an aspnetcore extract is NOT supplied the feed
         /// copy is cloned instead.
         ///
-        /// On the buildcache channel both extracts are supplied (both frameworks overridden); the per-side
+        /// On the ci channel both extracts are supplied (both frameworks overridden); the per-side
         /// parameters remain nullable so a single framework can be overlaid in isolation (e.g. unit tests).
         /// </summary>
         /// <returns>Absolute path to the per-job dotnet home root. Caller owns it.</returns>

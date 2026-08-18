@@ -2881,21 +2881,21 @@ namespace Microsoft.Crank.Agent
         /// reuse instead of freezing on the first build's bits), and either re-attaches the still-valid
         /// persistent SHA-keyed dotnet home / re-materializes it on drift (framework-dependent), or
         /// re-overlays the drifted framework into the published output (self-contained). Always re-stamps
-        /// the two "+buildcache.{sha}" reported versions so reused bisection runs stay distinguishable.
-        /// No-op unless the job is on the buildcache channel, BCS is enabled, and a marker exists (an older
+        /// the two "+ci.{sha}" reported versions so reused bisection runs stay distinguishable.
+        /// No-op unless the job is on the ci channel, BCS is enabled, and a marker exists (an older
         /// agent's reuse folder without a marker degrades gracefully to running the previously-built bits).
         /// </summary>
         private static async Task RefreshBuildCacheForReuseAsync(
             string path, string benchmarkedApp, Job job, string dotnetHome, JobContext jobContext, CancellationToken cancellationToken)
         {
-            if (!String.Equals(job.Channel, "buildcache", StringComparison.OrdinalIgnoreCase))
+            if (!String.Equals(job.Channel, "ci", StringComparison.OrdinalIgnoreCase))
             {
                 return;
             }
 
             if (!_buildCacheEnabled)
             {
-                Log.Info("Build Cache: reuse on buildcache channel but BCS is disabled on this agent; running previously-built bits.");
+                Log.Info("Build Cache: reuse on ci channel but BCS is disabled on this agent; running previously-built bits.");
                 return;
             }
 
@@ -2910,13 +2910,23 @@ namespace Microsoft.Crank.Agent
             {
                 // Re-resolve current shas for BOTH repos. An empty pin resolves to the branch's latest, so a
                 // reused build advances to newer BCS bits; a pinned sha resolves back to itself (idempotent).
-                var runtimeBranch = !string.IsNullOrEmpty(job.BuildCacheRuntimeBranch) ? job.BuildCacheRuntimeBranch : "main";
-                var runtimeResolved = await BuildCacheClient.ResolveCommitAsync(
-                    _buildCacheBaseUrl, BuildCacheClient.RepoNameRuntime, runtimeBranch, job.BuildCacheRuntimeCommitSha, null, cancellationToken);
+                // The pin is carried by runtimeVersion / aspNetCoreVersion on the ci channel.
+                var ciBranch = !string.IsNullOrEmpty(job.CiBranch) ? job.CiBranch : "main";
 
-                var aspNetBranch = !string.IsNullOrEmpty(job.BuildCacheAspNetCoreBranch) ? job.BuildCacheAspNetCoreBranch : "main";
+                if (!BuildCacheClient.TryResolveCiVersionPin(job.RuntimeVersion, "runtimeVersion", out var runtimeCommitPin, out var runtimePinError))
+                {
+                    throw new InvalidOperationException(runtimePinError);
+                }
+                if (!BuildCacheClient.TryResolveCiVersionPin(job.AspNetCoreVersion, "aspNetCoreVersion", out var aspNetCoreCommitPin, out var aspNetCorePinError))
+                {
+                    throw new InvalidOperationException(aspNetCorePinError);
+                }
+
+                var runtimeResolved = await BuildCacheClient.ResolveCommitAsync(
+                    _buildCacheBaseUrl, BuildCacheClient.RepoNameRuntime, ciBranch, runtimeCommitPin, null, cancellationToken);
+
                 var aspNetResolved = await BuildCacheClient.ResolveCommitAsync(
-                    _buildCacheBaseUrl, BuildCacheClient.RepoNameAspNetCore, aspNetBranch, job.BuildCacheAspNetCoreCommitSha, null, cancellationToken);
+                    _buildCacheBaseUrl, BuildCacheClient.RepoNameAspNetCore, ciBranch, aspNetCoreCommitPin, null, cancellationToken);
 
                 var curRuntimeSha = runtimeResolved.commitSha;
                 var curAspNetSha = aspNetResolved.commitSha;
@@ -3031,11 +3041,11 @@ namespace Microsoft.Crank.Agent
                 // runs are distinguishable and reflect any latest-advance (matches the fresh-build stamping).
                 if (!string.IsNullOrEmpty(curRuntimeSha))
                 {
-                    job.RuntimeVersion = $"{meta.RuntimeVersion}+buildcache.{BuildCacheClient.ShortSha(curRuntimeSha)}";
+                    job.RuntimeVersion = $"{meta.RuntimeVersion}+ci.{BuildCacheClient.ShortSha(curRuntimeSha)}";
                 }
                 if (!string.IsNullOrEmpty(curAspNetSha))
                 {
-                    job.AspNetCoreVersion = $"{meta.AspNetCoreVersion}+buildcache.{BuildCacheClient.ShortSha(curAspNetSha)}";
+                    job.AspNetCoreVersion = $"{meta.AspNetCoreVersion}+ci.{BuildCacheClient.ShortSha(curAspNetSha)}";
                 }
 
                 // Refresh the marker so a subsequent reuse compares against the shas we just applied.
@@ -3096,7 +3106,7 @@ namespace Microsoft.Crank.Agent
                 Log.Info("Skipping build step, reusing previous build");
 
                 // The reused build folder is being reattached without re-running the build/BCS-resolution
-                // step. For the buildcache channel that means re-resolving current shas and refreshing (or
+                // step. For the ci channel that means re-resolving current shas and refreshing (or
                 // re-attaching) the persistent SHA-keyed dotnet home so a framework-dependent job runs the
                 // intended BCS bits (not the feed runtime) and "latest" picks up newer builds on reuse.
                 await RefreshBuildCacheForReuseAsync(path, benchmarkedApp, job, dotnetHome, jobContext, cancellationToken);
@@ -3165,22 +3175,29 @@ namespace Microsoft.Crank.Agent
                 }
             }
 
-            // Build Cache Service: on the "buildcache" channel BOTH the base runtime
-            // (Microsoft.NETCore.App, from dotnet/runtime) and the ASP.NET Core shared framework
-            // (Microsoft.AspNetCore.App, from dotnet/aspnetcore) are overridden from BCS. Each repo
-            // resolves independently from its own latestBuilds.json / commit history: an empty per-repo
-            // commit sha means "latest build on that repo's branch"; a sha pins/bisects that repo while
-            // the other stays latest.
-            var isBuildCacheChannel = String.Equals(channel, "buildcache", StringComparison.OrdinalIgnoreCase);
+            // Build Cache Service: on the "ci" channel BOTH the base runtime (Microsoft.NETCore.App, from
+            // dotnet/runtime) and the ASP.NET Core shared framework (Microsoft.AspNetCore.App, from
+            // dotnet/aspnetcore) are overridden from BCS. Each repo's build is selected via the existing
+            // runtimeVersion / aspNetCoreVersion arguments, which on this channel carry a commit SHA (empty
+            // = the latest build on the branch) rather than a feed version; a sha pins/bisects that repo
+            // while the other stays latest.
+            var isBuildCacheChannel = String.Equals(channel, "ci", StringComparison.OrdinalIgnoreCase);
             var useBuildCache = isBuildCacheChannel;
 
-            if (String.IsNullOrEmpty(runtimeVersion))
+            if (isBuildCacheChannel)
             {
-                // The base runtime resolves to a real feed version; BCS overlays its bits onto that folder.
-                runtimeVersion = isBuildCacheChannel ? "latest" : channel;
+                // On the ci channel runtimeVersion carries a Build Cache commit pin (or empty = latest), not
+                // a feed version. The base runtime FOLDER is always the latest feed version (BCS bits overlay
+                // on top), so force "latest" here; the pin is parsed from job.RuntimeVersion in the
+                // useBuildCache block below. This also keeps a SHA from leaking into ResolveRuntimeVersion.
+                runtimeVersion = "latest";
+            }
+            else if (String.IsNullOrEmpty(runtimeVersion))
+            {
+                runtimeVersion = channel;
             }
 
-            // For buildcache channel, the components NOT overridden by BCS use "latest" from feeds.
+            // For the ci channel, the components NOT overridden by BCS use "latest" from feeds.
             var nonRuntimeChannel = isBuildCacheChannel ? "latest" : channel;
 
             if (String.IsNullOrEmpty(desktopVersion))
@@ -3188,10 +3205,15 @@ namespace Microsoft.Crank.Agent
                 desktopVersion = nonRuntimeChannel;
             }
 
-            if (String.IsNullOrEmpty(aspNetCoreVersion))
+            if (isBuildCacheChannel)
             {
-                // The ASP.NET Core shared-framework VERSION (folder name) is feed-resolved even on the
-                // buildcache channel; the CONTENTS are placed directly from the BCS pack into that folder.
+                // Same as runtimeVersion: on the ci channel aspNetCoreVersion carries a commit pin, not a
+                // feed version. The ASP.NET Core shared-framework FOLDER name is feed-resolved to latest; the
+                // CONTENTS are placed directly from the BCS pack. Force "latest"; the pin is parsed below.
+                aspNetCoreVersion = "latest";
+            }
+            else if (String.IsNullOrEmpty(aspNetCoreVersion))
+            {
                 aspNetCoreVersion = nonRuntimeChannel;
             }
 
@@ -3202,7 +3224,7 @@ namespace Microsoft.Crank.Agent
 
             runtimeVersion = await ResolveRuntimeVersion(buildToolsPath, targetFramework, runtimeVersion);
 
-            // Per-repo BCS resolution outputs (both frameworks are always overridden on the buildcache channel).
+            // Per-repo BCS resolution outputs (both frameworks are always overridden on the ci channel).
             string runtimeBuildCacheCommitSha = null;
             string aspNetCoreBuildCacheCommitSha = null;
             string runtimeBuildCacheExtractDir = null;
@@ -3225,17 +3247,18 @@ namespace Microsoft.Crank.Agent
                     return null;
                 }
 
-                // Validate user-supplied commit SHAs early so we can fail with a clear message instead
-                // of throwing later from a Substring call.
-                if (!string.IsNullOrEmpty(job.BuildCacheRuntimeCommitSha) && job.BuildCacheRuntimeCommitSha.Length < 8)
+                // On the ci channel runtimeVersion / aspNetCoreVersion carry a Build Cache commit pin (empty
+                // = latest build on the branch). Parse them here and fail with a clear message if a version
+                // string was supplied instead of a SHA.
+                if (!BuildCacheClient.TryResolveCiVersionPin(job.RuntimeVersion, "runtimeVersion", out var runtimeCommitPin, out var runtimePinError))
                 {
-                    job.Error = $"Build Cache: 'buildCacheRuntimeCommitSha' must be at least 8 characters long (got '{job.BuildCacheRuntimeCommitSha}').";
+                    job.Error = runtimePinError;
                     return null;
                 }
 
-                if (!string.IsNullOrEmpty(job.BuildCacheAspNetCoreCommitSha) && job.BuildCacheAspNetCoreCommitSha.Length < 8)
+                if (!BuildCacheClient.TryResolveCiVersionPin(job.AspNetCoreVersion, "aspNetCoreVersion", out var aspNetCoreCommitPin, out var aspNetCorePinError))
                 {
-                    job.Error = $"Build Cache: 'buildCacheAspNetCoreCommitSha' must be at least 8 characters long (got '{job.BuildCacheAspNetCoreCommitSha}').";
+                    job.Error = aspNetCorePinError;
                     return null;
                 }
 
@@ -3246,15 +3269,14 @@ namespace Microsoft.Crank.Agent
                     // this exact (runtime sha, aspnet sha, versions, rid) combination.
                     // ResolveCommitAsync/DownloadAndExtractAsync derive the flavour (config map + RepoName
                     // path segment) from the repoName we pass, so each repo routes to its own BCS blobs.
-                    var runtimeBranch = !string.IsNullOrEmpty(job.BuildCacheRuntimeBranch) ? job.BuildCacheRuntimeBranch : "main";
+                    var ciBranch = !string.IsNullOrEmpty(job.CiBranch) ? job.CiBranch : "main";
                     var runtimeResolved = await BuildCacheClient.ResolveCommitAsync(
-                        _buildCacheBaseUrl, BuildCacheClient.RepoNameRuntime, runtimeBranch, job.BuildCacheRuntimeCommitSha, null, cancellationToken);
+                        _buildCacheBaseUrl, BuildCacheClient.RepoNameRuntime, ciBranch, runtimeCommitPin, null, cancellationToken);
                     runtimeBuildCacheCommitSha = runtimeResolved.commitSha;
                     runtimeBuildCacheConfigResolved = runtimeResolved.buildCacheConfig;
 
-                    var aspNetBranch = !string.IsNullOrEmpty(job.BuildCacheAspNetCoreBranch) ? job.BuildCacheAspNetCoreBranch : "main";
                     var aspNetResolved = await BuildCacheClient.ResolveCommitAsync(
-                        _buildCacheBaseUrl, BuildCacheClient.RepoNameAspNetCore, aspNetBranch, job.BuildCacheAspNetCoreCommitSha, null, cancellationToken);
+                        _buildCacheBaseUrl, BuildCacheClient.RepoNameAspNetCore, ciBranch, aspNetCoreCommitPin, null, cancellationToken);
                     aspNetCoreBuildCacheCommitSha = aspNetResolved.commitSha;
                     aspNetCoreBuildCacheConfigResolved = aspNetResolved.buildCacheConfig;
 
@@ -3905,7 +3927,7 @@ namespace Microsoft.Crank.Agent
                 }
 
                 // Stamp the BCS commit onto each overridden framework's reported version. This runs on the
-                // buildcache channel regardless of whether the archive was downloaded this run (a persistent
+                // buildcache resolution regardless of whether the archive was downloaded this run (a persistent
                 // home cache-hit skips the download but the versions must still carry the resolved sha so
                 // bisection runs stay distinguishable). Appended, not replaced, so PatchRuntimeConfig below
                 // still uses the clean feed-resolved local versions.
@@ -3913,11 +3935,11 @@ namespace Microsoft.Crank.Agent
                 {
                         if (!string.IsNullOrEmpty(runtimeBuildCacheCommitSha))
                         {
-                            job.RuntimeVersion = $"{runtimeVersion}+buildcache.{BuildCacheClient.ShortSha(runtimeBuildCacheCommitSha)}";
+                            job.RuntimeVersion = $"{runtimeVersion}+ci.{BuildCacheClient.ShortSha(runtimeBuildCacheCommitSha)}";
                         }
                         if (!string.IsNullOrEmpty(aspNetCoreBuildCacheCommitSha))
                         {
-                            job.AspNetCoreVersion = $"{aspNetCoreVersion}+buildcache.{BuildCacheClient.ShortSha(aspNetCoreBuildCacheCommitSha)}";
+                            job.AspNetCoreVersion = $"{aspNetCoreVersion}+ci.{BuildCacheClient.ShortSha(aspNetCoreBuildCacheCommitSha)}";
                         }
                 }
 
@@ -4415,13 +4437,13 @@ namespace Microsoft.Crank.Agent
 
             switch (aspNetCoreVersion.ToLowerInvariant())
             {
-                case "buildcache":
-                    // Defensive: the aspnetcore buildcache flavour rewrites aspNetCoreVersion to "Latest"
-                    // in the BCS prep block before this point, so this normally isn't hit. Treat the raw
-                    // sentinel as Latest so the shared-framework version still resolves to a real feed
-                    // version (the folder the BCS bits overlay onto).
+                case "ci":
+                    // Defensive: on the ci channel aspNetCoreVersion is forced to "latest" before this point
+                    // (the BCS pack is placed into the feed-resolved folder), so this normally isn't hit.
+                    // Treat the raw sentinel as Latest so the shared-framework version still resolves to a
+                    // real feed version (the folder the BCS bits are placed into).
                     aspNetCoreVersion = await ResolveAspNetCoreVersion("Latest", targetFramework);
-                    Log.Info($"ASP.NET: {aspNetCoreVersion} (BuildCache → Latest)");
+                    Log.Info($"ASP.NET: {aspNetCoreVersion} (ci → Latest)");
                     break;
                 case "current":
                     aspNetCoreVersion = string.IsNullOrEmpty(currentAspNetCoreVersion)
