@@ -131,6 +131,8 @@ On this channel crank always overrides **both** frameworks, each resolved from i
 
 Each repository resolves **independently**: by default both use the latest cached build on `main`. Provide `buildCacheRuntimeCommitSha` / `buildCacheAspNetCoreCommitSha` (and/or `buildCacheRuntimeBranch` / `buildCacheAspNetCoreBranch`) to pin or bisect one repo while the other stays latest.
 
+> **Note:** On the `buildcache` channel the framework **version** knobs `runtimeVersion` and `aspNetCoreVersion` are **not** used to pin the bits — the base shared-framework folder is always resolved to the latest feed version and the BCS build is overlaid/placed on top of it. Pin or bisect via the commit SHA (`buildCacheRuntimeCommitSha` / `buildCacheAspNetCoreCommitSha`) instead. Setting `runtimeVersion` or `aspNetCoreVersion` to anything other than empty or `latest` on this channel is **rejected with an error** rather than silently ignored, so a run can never report a version that wasn't actually used.
+
 ### Basic usage (latest cached build of both frameworks on main)
 
 ```
