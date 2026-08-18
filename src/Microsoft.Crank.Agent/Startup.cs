@@ -3048,6 +3048,16 @@ namespace Microsoft.Crank.Agent
                     job.AspNetCoreVersion = $"{meta.AspNetCoreVersion}+ci.{BuildCacheClient.ShortSha(curAspNetSha)}";
                 }
 
+                // Record the reported versions as result measurements carrying the "+ci.{sha}" stamp. The reuse
+                // path returns before the fresh-build measurement recording, so without this a reused ci run would
+                // surface no netCoreAppVersion/aspNetCoreVersion at all. Using the existing keys keeps reused and
+                // fresh ci runs identical in the results (and in the SQL/ES document). Gated implicitly on the ci
+                // channel via the non-empty resolved shas.
+                RecordBuildCacheCiVersionMeasurement(
+                    job, Measurements.BenchmarksAspNetCoreVersion, "ASP.NET Core Version", meta.AspNetCoreVersion, curAspNetSha);
+                RecordBuildCacheCiVersionMeasurement(
+                    job, Measurements.BenchmarksNetCoreAppVersion, ".NET Runtime Version", meta.RuntimeVersion, curRuntimeSha);
+
                 // Refresh the marker so a subsequent reuse compares against the shas we just applied.
                 if (runtimeDrift || aspNetDrift)
                 {
@@ -3069,6 +3079,48 @@ namespace Microsoft.Crank.Agent
                 // wrong (feed) runtime.
                 job.Error = $"Build Cache: failed to refresh reused build: {ex.Message}";
             }
+        }
+
+        /// <summary>
+        /// Records a result measurement carrying the "+ci.{sha}" build-cache stamp (feed version + resolved BCS
+        /// commit truncated to <see cref="CommitHashLength"/> chars) under the given key. Used by the reuse path,
+        /// which returns before the fresh-build version recording, to surface the AspNetCoreVersion/NetCoreAppVersion
+        /// measurements for reused ci runs. No-op when the sha is empty or the key was already recorded this job.
+        /// </summary>
+        private static void RecordBuildCacheCiVersionMeasurement(Job job, string measurementName, string description, string feedVersion, string commitSha)
+        {
+            if (string.IsNullOrEmpty(commitSha))
+            {
+                return;
+            }
+
+            if (job.Metadata.Any(x => x.Name == measurementName))
+            {
+                return;
+            }
+
+            job.Metadata.Enqueue(new MeasurementMetadata
+            {
+                Source = "Host Process",
+                Name = measurementName,
+                Aggregate = Operation.First, // Use first as iterations won't repeat it in next runs
+                Reduce = Operation.First,
+                Format = "",
+                LongDescription = description,
+                ShortDescription = description
+            });
+
+            // Truncate to 12 chars (CommitHashLength) so the reuse-path value matches the fresh-build
+            // AspNetCoreVersion/NetCoreAppVersion (.version-file) measurements, which are also 12-char.
+            // (The internal job.RuntimeVersion/AspNetCoreVersion DTO stamp keeps its 8-char ShortSha.)
+            var shortSha = commitSha.Length >= CommitHashLength ? commitSha.Substring(0, CommitHashLength) : commitSha;
+
+            job.Measurements.Enqueue(new Measurement
+            {
+                Name = measurementName,
+                Timestamp = DateTime.UtcNow,
+                Value = $"{feedVersion}+ci.{shortSha}"
+            });
         }
 
         private static async Task<string> CloneRestoreAndBuild(string path, Job job, string dotnetHome, JobContext jobContext = null, CancellationToken cancellationToken = default)
@@ -3694,7 +3746,7 @@ namespace Microsoft.Crank.Agent
                     {
                         Name = Measurements.BenchmarksAspNetCoreVersion,
                         Timestamp = DateTime.UtcNow,
-                        Value = $"{aspNetCoreVersion}+{aspnetCoreCommitHash.Substring(0, CommitHashLength)}"
+                        Value = $"{aspNetCoreVersion}+{(useBuildCache ? "ci." : "")}{aspnetCoreCommitHash.Substring(0, CommitHashLength)}"
                     });
 
                     knownDependencies.Add(new Dependency { Names = new[] { "Microsoft.AspNetCore.App" }, CommitHash = aspnetCoreCommitHash, RepositoryUrl = "https://github.com/dotnet/aspnetcore", Version = aspNetCoreVersion });
@@ -3727,7 +3779,7 @@ namespace Microsoft.Crank.Agent
                     {
                         Name = Measurements.BenchmarksNetCoreAppVersion,
                         Timestamp = DateTime.UtcNow,
-                        Value = $"{runtimeVersion}+{netCoreAppCommitHash.Substring(0, CommitHashLength)}"
+                        Value = $"{runtimeVersion}+{(useBuildCache ? "ci." : "")}{netCoreAppCommitHash.Substring(0, CommitHashLength)}"
                     });
 
                     knownDependencies.Add(new Dependency { Names = new[] { "Microsoft.NETCore.App" }, CommitHash = netCoreAppCommitHash, RepositoryUrl = "https://github.com/dotnet/runtime", Version = runtimeVersion });
