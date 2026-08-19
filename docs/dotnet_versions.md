@@ -129,7 +129,7 @@ On this channel crank always overrides **both** frameworks, each resolved from i
 - **Base runtime** (`Microsoft.NETCore.App`) is **overlaid** with BCS bits built from a [dotnet/runtime](https://github.com/dotnet/runtime) commit. The runtime archive is raw build output (no shared-framework metadata), so BCS binaries are overlaid onto a feed-installed runtime.
 - **ASP.NET Core shared framework** (`Microsoft.AspNetCore.App`) is **placed directly** from a [dotnet/aspnetcore](https://github.com/dotnet/aspnetcore) commit's BCS build. The aspnetcore archive is the runtime-pack nupkg stored verbatim (carrying `deps.json` + `runtimeconfig.json`), so the framework folder is built entirely from BCS and the job **fails** if the pack is incomplete.
 
-Each repository resolves **independently**: by default both use the latest cached build on `main`. On the `ci` channel the existing `runtimeVersion` and `aspNetCoreVersion` arguments carry a **commit SHA** rather than a feed version — supply a SHA to pin/bisect one repo while the other stays latest, or leave it empty to use the latest cached build. A single `ciBranch` argument selects the branch queried for the latest build of both repos (default `main`).
+Each repository resolves **independently**: by default both use the latest cached build on `main`. On the `ci` channel the existing `runtimeVersion` and `aspNetCoreVersion` arguments carry a **commit SHA** rather than a feed version — supply a SHA to pin/bisect one repo while the other stays latest, or leave it empty to use the latest cached build. The *latest* lookup always targets `main` (the pipeline only builds `main`).
 
 > **Note:** On the `ci` channel, `runtimeVersion` / `aspNetCoreVersion` accept **only** a commit SHA (8–40 hex characters) or an empty value (= latest cached build). A feed version string is **rejected with an error** — version-string pinning is not supported on this channel. Conversely, on the other channels (`current` / `latest` / `edge`) those same arguments accept a version string and do **not** accept a commit SHA. The reported `runtimeVersion` / `aspNetCoreVersion` for a `ci` run are stamped with the resolved commit as `{feedVersion}+ci.{shortSha}`.
 
@@ -161,21 +161,12 @@ Each repository resolves **independently**: by default both use the latest cache
 
 If a requested commit is not found in the cache, crank fails with an error rather than falling back.
 
-### Different branch (shared)
-
-```
-> crank --config benchmarks.yml --scenario json --profile aspnet-perf-lin --application.channel ci --application.ciBranch release/10.0
-```
-
-`ciBranch` is only consulted when the corresponding version argument is empty (i.e. when resolving *latest*); an explicit commit SHA is looked up directly and does not depend on the branch. It applies to **both** repos, so it assumes dotnet/runtime and dotnet/aspnetcore use parallel branch names (e.g. `release/10.0`). In practice `main` covers the overwhelming majority of runs.
-
 ### `ci` channel properties
 
 | Property | Default | Description |
 |----------|---------|-------------|
-| `runtimeVersion` | (empty = latest) | On the `ci` channel: a [dotnet/runtime](https://github.com/dotnet/runtime) commit SHA (8–40 hex chars) to resolve from BCS and overlay onto `Microsoft.NETCore.App`. Empty uses the latest cached runtime build on `ciBranch`. A feed version string is rejected with an error. |
-| `aspNetCoreVersion` | (empty = latest) | On the `ci` channel: a [dotnet/aspnetcore](https://github.com/dotnet/aspnetcore) commit SHA (8–40 hex chars) to resolve from BCS and place as `Microsoft.AspNetCore.App`. Empty uses the latest cached aspnetcore build on `ciBranch`. A feed version string is rejected with an error. |
-| `ciBranch` | `main` | Branch queried for the *latest* cached build of both repos. Only used when the corresponding version argument is empty. |
+| `runtimeVersion` | (empty = latest) | On the `ci` channel: a [dotnet/runtime](https://github.com/dotnet/runtime) commit SHA (8–40 hex chars) to resolve from BCS and overlay onto `Microsoft.NETCore.App`. Empty uses the latest cached runtime build on `main`. A feed version string is rejected with an error. |
+| `aspNetCoreVersion` | (empty = latest) | On the `ci` channel: a [dotnet/aspnetcore](https://github.com/dotnet/aspnetcore) commit SHA (8–40 hex chars) to resolve from BCS and place as `Microsoft.AspNetCore.App`. Empty uses the latest cached aspnetcore build on `main`. A feed version string is rejected with an error. |
 
 The BCS configuration key (e.g., `coreclr_x64_linux` for runtime, `aspnetcore_x64_linux` for aspnetcore) is auto-detected per repo from the agent platform. Platforms with no aspnetcore config (there is no macOS/musl/arm32 in v1) fail loud rather than silently skipping.
 

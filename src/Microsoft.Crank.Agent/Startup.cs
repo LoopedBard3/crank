@@ -2908,11 +2908,9 @@ namespace Microsoft.Crank.Agent
 
             try
             {
-                // Re-resolve current shas for BOTH repos. An empty pin resolves to the branch's latest, so a
+                // Re-resolve current shas for BOTH repos. An empty pin resolves to main's latest, so a
                 // reused build advances to newer BCS bits; a pinned sha resolves back to itself (idempotent).
                 // The pin is carried by runtimeVersion / aspNetCoreVersion on the ci channel.
-                var ciBranch = !string.IsNullOrEmpty(job.CiBranch) ? job.CiBranch : "main";
-
                 if (!BuildCacheClient.TryResolveCiVersionPin(job.RuntimeVersion, "runtimeVersion", out var runtimeCommitPin, out var runtimePinError))
                 {
                     throw new InvalidOperationException(runtimePinError);
@@ -2923,10 +2921,10 @@ namespace Microsoft.Crank.Agent
                 }
 
                 var runtimeResolved = await BuildCacheClient.ResolveCommitAsync(
-                    _buildCacheBaseUrl, BuildCacheClient.RepoNameRuntime, ciBranch, runtimeCommitPin, null, cancellationToken);
+                    _buildCacheBaseUrl, BuildCacheClient.RepoNameRuntime, "main", runtimeCommitPin, null, cancellationToken);
 
                 var aspNetResolved = await BuildCacheClient.ResolveCommitAsync(
-                    _buildCacheBaseUrl, BuildCacheClient.RepoNameAspNetCore, ciBranch, aspNetCoreCommitPin, null, cancellationToken);
+                    _buildCacheBaseUrl, BuildCacheClient.RepoNameAspNetCore, "main", aspNetCoreCommitPin, null, cancellationToken);
 
                 var curRuntimeSha = runtimeResolved.commitSha;
                 var curAspNetSha = aspNetResolved.commitSha;
@@ -3321,14 +3319,13 @@ namespace Microsoft.Crank.Agent
                     // this exact (runtime sha, aspnet sha, versions, rid) combination.
                     // ResolveCommitAsync/DownloadAndExtractAsync derive the flavour (config map + RepoName
                     // path segment) from the repoName we pass, so each repo routes to its own BCS blobs.
-                    var ciBranch = !string.IsNullOrEmpty(job.CiBranch) ? job.CiBranch : "main";
                     var runtimeResolved = await BuildCacheClient.ResolveCommitAsync(
-                        _buildCacheBaseUrl, BuildCacheClient.RepoNameRuntime, ciBranch, runtimeCommitPin, null, cancellationToken);
+                        _buildCacheBaseUrl, BuildCacheClient.RepoNameRuntime, "main", runtimeCommitPin, null, cancellationToken);
                     runtimeBuildCacheCommitSha = runtimeResolved.commitSha;
                     runtimeBuildCacheConfigResolved = runtimeResolved.buildCacheConfig;
 
                     var aspNetResolved = await BuildCacheClient.ResolveCommitAsync(
-                        _buildCacheBaseUrl, BuildCacheClient.RepoNameAspNetCore, ciBranch, aspNetCoreCommitPin, null, cancellationToken);
+                        _buildCacheBaseUrl, BuildCacheClient.RepoNameAspNetCore, "main", aspNetCoreCommitPin, null, cancellationToken);
                     aspNetCoreBuildCacheCommitSha = aspNetResolved.commitSha;
                     aspNetCoreBuildCacheConfigResolved = aspNetResolved.buildCacheConfig;
 

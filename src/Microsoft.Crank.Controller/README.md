@@ -82,8 +82,6 @@ Run 'crank [command] -?|-h|--help' for more information about a command.
                                                                 in the build arguments. By default the latest available build is used.  Setting this value forces the app to
                                                                 be deployed as stand-alone. On the `ci` channel this instead carries a dotnet/aspnetcore commit SHA
                                                                 (8-40 hex chars; empty = latest cached build); a feed version string is rejected on that channel.
-  --[JOB].ciBranch <branch>                                     Only used on the `ci` channel. Branch queried for the latest cached BCS build of both dotnet/runtime and
-                                                                dotnet/aspnetcore when the corresponding version argument is empty. Default is main.
   --[JOB].noGlobalJson <true|false>                             Whether to not emit any global.json file to force the .NET SDK version to use. Default is false, meaning
                                                                 whatever version of the .NET SDK is chosen, it will be set in a global.json file.
   --[JOB].framework <tfm>                                       The framework version to use in case it can't be assumed from the .NET runtime version. e.g., net8.0
