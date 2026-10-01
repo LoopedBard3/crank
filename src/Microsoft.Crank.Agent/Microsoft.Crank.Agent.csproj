@@ -34,6 +34,7 @@
     <PackageReference Include="Microsoft.Windows.CsWin32" PrivateAssets="all" />
     <PackageReference Include="Mono.Unix" />
     <PackageReference Include="NuGet.Versioning" />
+    <PackageReference Include="NuGet.Configuration" />
     <PackageReference Include="Serilog.Formatting.Compact" />
     <PackageReference Include="Serilog.Sinks.Console" />
     <PackageReference Include="Serilog.Sinks.File" />

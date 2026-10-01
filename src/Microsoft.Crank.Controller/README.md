@@ -76,12 +76,12 @@ Run 'crank [command] -?|-h|--help' for more information about a command.
   --[JOB].sdkVersion <version>                                  The version of the .NET SDK to install and use. By default the latest available build is used.
   --[JOB].runtimeVersion <version>                              The version of the .NET runtime to install and use. It is defined as MicrosoftNETCoreAppPackageVersion
                                                                 in the build arguments. By default the latest available build is used. Setting this value forces the app to
-                                                                be deployed as stand-alone. On the `ci` channel this instead carries a dotnet/runtime commit SHA
-                                                                (8-40 hex chars; empty = latest cached build); a feed version string is rejected on that channel.
+                                                                be deployed as stand-alone. Independently accepts ci (latest complete dotnet/runtime BCS build) or a full
+                                                                40-hex commit SHA under any channel. Empty inherits channel; explicit latest always selects feeds.
   --[JOB].aspNetCoreVersion <version>                           The version of the ASP.NET runtime to install and use. It is defined as MicrosoftAspNetCoreAppPackageVersion
                                                                 in the build arguments. By default the latest available build is used.  Setting this value forces the app to
-                                                                be deployed as stand-alone. On the `ci` channel this instead carries a dotnet/aspnetcore commit SHA
-                                                                (8-40 hex chars; empty = latest cached build); a feed version string is rejected on that channel.
+                                                                be deployed as stand-alone. Independently accepts ci (latest complete dotnet/aspnetcore BCS build) or a full
+                                                                40-hex commit SHA under any channel. Empty inherits channel; explicit latest always selects feeds.
   --[JOB].noGlobalJson <true|false>                             Whether to not emit any global.json file to force the .NET SDK version to use. Default is false, meaning
                                                                 whatever version of the .NET SDK is chosen, it will be set in a global.json file.
   --[JOB].framework <tfm>                                       The framework version to use in case it can't be assumed from the .NET runtime version. e.g., net8.0
@@ -186,4 +186,3 @@ Run 'crank [command] -?|-h|--help' for more information about a command.
   ## Measurements
 
   --[JOB].options.discardResults <true|false>                   Whether to discard all the results from this job, for instance during a warmup job.
-

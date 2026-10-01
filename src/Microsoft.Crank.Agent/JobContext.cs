@@ -31,19 +31,21 @@ namespace Microsoft.Crank.Agent
         public Dictionary<string, string> SourceDirs { get; set; } = new();
         public string DockerImage { get; set; }
         public string DockerContainerId { get; set; }
+        public Task BuildTask { get; set; }
+        public CancellationTokenSource BuildCancellationTokenSource { get; set; }
 
         /// <summary>
         /// Per-job isolated dotnet home used for buildcache runs. When non-null, the agent should
-        /// run the application using this root (so the BCS-overlaid runtime is loaded), and the
-        /// global dotnet home is left untouched for concurrent jobs. The directory is owned by
-        /// the job and deleted when the job completes.
+        /// run the application using this root (so the complete selected runtime is loaded), and the
+        /// global dotnet home is left untouched for concurrent jobs. The directory is private to
+        /// the job and deleted after its processes stop, unless cleanup is disabled.
         /// </summary>
         public string BuildCacheDotnetHome { get; set; }
 
         /// <summary>
         /// Temporary directories holding the extracted BCS archives for this job (one per repo:
         /// runtime and aspnetcore). Deleted at the end of the job; the underlying archives in the
-        /// parent commit directory are kept so subsequent jobs for the same commit can reuse them
+        /// immutable content-identity directory are kept so subsequent jobs can reuse them
         /// without re-downloading.
         /// </summary>
         public string BuildCacheRuntimeExtractDir { get; set; }

@@ -165,7 +165,7 @@ namespace Microsoft.Crank.RegressionBot.Models
                             Names = new[] { "Microsoft.AspNetCore.App" },
                             RepositoryUrl = "https://github.com/dotnet/aspnetcore",
                             Version = versionSegments.FirstOrDefault(),
-                            CommitHash = versionSegments.Skip(1).FirstOrDefault()
+                            CommitHash = NormalizeCommit(versionSegments.Skip(1).FirstOrDefault())
                         }).ToArray();
                 }
 
@@ -180,8 +180,14 @@ namespace Microsoft.Crank.RegressionBot.Models
                             Names = new[] { "Microsoft.NETCore.App" },
                             RepositoryUrl = "https://github.com/dotnet/runtime",
                             Version = versionSegments.FirstOrDefault(),
-                            CommitHash = versionSegments.Skip(1).FirstOrDefault()
+                            CommitHash = NormalizeCommit(versionSegments.Skip(1).FirstOrDefault())
                         }).ToArray();
+                }
+
+                static string NormalizeCommit(string commit)
+                {
+                    // Older CI-channel results used version+ci.sha instead of version+sha.
+                    return commit?.StartsWith("ci.", StringComparison.Ordinal) == true ? commit.Substring(3) : commit;
                 }
             }
         }
