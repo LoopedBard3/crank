@@ -38,6 +38,7 @@ namespace Microsoft.Crank.Agent
         /// </summary>
         public string BuildCacheDotnetHome { get; set; }
         public Task BuildAndRunTask { get; set; }
+        internal string OwnedBuildPath { get; set; }
 
         public ulong EventPipeSessionId { get; set; }
         public Task EventPipeTask { get; set; }

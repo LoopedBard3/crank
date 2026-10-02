@@ -198,10 +198,48 @@ post-publish overlay. A missing selected BCS pack fails without fallback.
 Active `useMonoRuntime` modes are rejected for CI selections because they would replace
 the selected CoreCLR bits after publishing.
 
-Skipping a previously cached build (`reuseBuild`/`noBuild` on an actual cache hit)
-is explicitly unsupported for CI selections in this initial implementation.
-Source caching and fresh rebuilds with `buildKey` remain supported. This restriction
-avoids mutating or silently running a shared reused app with the wrong runtime.
+### Reusing a CI application build
+
+`reuseBuild` / `noBuild` can reuse a completed **project publish** under the existing
+`buildKey` when both the requested build settings and the resolved inputs still match.
+No controller build-key changes are needed: explicit commit selectors already
+participate in the key. The agent resolves floating `ci` selectors once per component
+on every run, as well as the current SDK and compile-feed versions. Matching product
+versions alone are not sufficient; a different full commit or BCS feed URL is a miss.
+
+The agent atomically writes `.ci-build.json` beside the cached build only after the
+whole build succeeds, including runtimeconfig changes, output attachments, and
+dependency reporting. This versioned completion record includes resolved commits,
+framework versions, source identities, SDK/TFM/RID/publish mode, compile-feed versions,
+and reusable result metadata. The existing `_options` request guard alone is not
+proof that a publish succeeded.
+
+| Cache hit | Work performed |
+|-----------|----------------|
+| Framework-dependent | Install the same selected frameworks into a **new private runtime home**; run the cached application without SDK installation, restore, compile, publish, output-attachment copying, or runtimeconfig rewriting |
+| Self-contained | Run the cached output unchanged, without framework installation, runtime-pack bootstrap, restore, or publish |
+
+Both paths restore full commit/version and SDK measurements and dependency results,
+but do not report the previous build duration as a new build. Missing, malformed,
+or old-schema completion records, changed resolved inputs, or missing expected
+assembly/deps/runtimeconfig (and SCD apphost) cause a **normal rebuild**, not a permanent
+reuse error. The previous record is invalidated before rebuilding. Resolution or
+installation failures fail the job; cached old selections are never a fallback.
+Without `noBuild`, the normal fresh-build behavior remains.
+
+This is exact-selection reuse, not reuse of one compilation across different runtime
+commits: any resolved commit change conservatively rebuilds FDD and SCD. Ordinary
+source caching is unchanged. Custom executable jobs do not get a completion record;
+the existing rejection of SCD executable overrides still applies.
+
+Jobs sharing a build directory are serialized for its entire lifetime, including
+execution and shutdown. Contending jobs are deferred before initialization without
+blocking the owner's stop/delete processing. `noClean` can retain files without
+retaining ownership once the owner is confirmed stopped. If writer or process
+termination cannot be confirmed, the agent retains ownership and logs the path
+rather than allowing another job to overwrite it; that key remains unavailable.
+Completed faulted or canceled builds do not retain the key once stopping and process
+exit are confirmed, so a failed resolution can be retried under the same key.
 No persistent framework-home cache, eviction budget, or latest-resolution scheduler
 is introduced. See [the producer contract](build_cache_requirements.md) for payload
 paths and supported platforms.

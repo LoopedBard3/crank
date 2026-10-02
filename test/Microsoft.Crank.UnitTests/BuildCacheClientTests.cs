@@ -20,6 +20,7 @@ using Xunit;
 
 namespace Microsoft.Crank.UnitTests
 {
+    [Collection("Agent startup")]
     public class BuildCacheClientTests
     {
         private const string Sha = "1234567890abcdef1234567890abcdef12345678";
@@ -83,6 +84,32 @@ namespace Microsoft.Crank.UnitTests
             var build = await BuildCacheClient.ResolveAsync(client, "https://example.test", "runtime", "ci", "linux-x64", default);
             Assert.Equal(Sha, build.CommitSha);
             Assert.Equal(2, handler.Requests.Count);
+        }
+
+        [Theory]
+        [InlineData("runtime", "coreclr_x64_windows", "Runtime")]
+        [InlineData("aspnetcore", "aspnetcore_x64_windows", "aspnetcore/Runtime")]
+        public async Task FloatingCiResolvesEachRunAndDetectsSameVersionCommitAdvance(string repo, string config, string product)
+        {
+            var latest = $"https://example.test/builds/{repo}/latest/main/latestBuilds.json";
+            var responses = new Dictionary<string, string>();
+            using var handler = new Handler(responses);
+            using var client = new HttpClient(handler);
+            var next = new string('b', 40);
+            foreach (var commit in new[] { Sha, next })
+                responses[$"https://example.test/builds/{repo}/buildArtifacts/{commit}/{config}/install/{product}/main/latest.version"] = $"{commit}\n12.0.0-dev";
+            responses[latest] = new JObject { [config] = new JObject { ["CommitSha"] = Sha } }.ToString();
+            var first = await BuildCacheClient.ResolveAsync(client, "https://example.test", repo, "ci", "win-x64", default);
+            var unchanged = await BuildCacheClient.ResolveAsync(client, "https://example.test", repo, "ci", "win-x64", default);
+            Assert.Equal(first, unchanged);
+            responses[latest] = new JObject { [config] = new JObject { ["CommitSha"] = next } }.ToString();
+            var advanced = await BuildCacheClient.ResolveAsync(client, "https://example.test", repo, "ci", "win-x64", default);
+            Assert.Equal(first.Version, advanced.Version);
+            Assert.NotEqual(first, advanced);
+            Assert.Equal(6, handler.Requests.Count);
+            Assert.Equal(latest, handler.Requests[0]);
+            Assert.Equal(latest, handler.Requests[2]);
+            Assert.Equal(latest, handler.Requests[4]);
         }
 
         [Theory]
@@ -207,11 +234,8 @@ namespace Microsoft.Crank.UnitTests
             finally { Directory.Delete(root, true); }
         }
 
-        [Theory]
-        [InlineData("ci", true)]
-        [InlineData(Sha, true)]
-        [InlineData("latest", false)]
-        public async Task ActualBuildReuseFailsClosedOnlyForCiSelections(string selector, bool ci)
+        [Fact]
+        public async Task NonCiBuildReuseKeepsExistingSkipBehavior()
         {
             var root = Directory.CreateTempSubdirectory("crank-ci-test-").FullName;
             var rootField = typeof(Startup).GetField("_rootTempDir", BindingFlags.Static | BindingFlags.NonPublic);
@@ -219,22 +243,16 @@ namespace Microsoft.Crank.UnitTests
             try
             {
                 rootField.SetValue(null, root);
-                var job = new Job { RuntimeVersion = selector, AspNetCoreVersion = "latest", Project = "test.csproj", NoBuild = true, BuildKey = "reuse-test" };
+                var job = new Job { RuntimeVersion = "latest", AspNetCoreVersion = "latest", Project = "test.csproj", NoBuild = true, BuildKey = "reuse-test" };
                 var options = Path.Combine(root, "_options");
                 Directory.CreateDirectory(options);
                 File.WriteAllText(Path.Combine(options, "reuse-test.json"), JsonConvert.SerializeObject(job.GetBuildKeyData()));
+                File.WriteAllText(Path.Combine(root, CiBuildRecord.FileName), "old CI completion for an explicitly reused key");
                 var clone = typeof(Startup).GetMethod("CloneRestoreAndBuild", BindingFlags.Static | BindingFlags.NonPublic);
                 var result = await (Task<string>)clone.Invoke(null, new object[] { root, job, root, new JobContext(), CancellationToken.None });
-                if (ci)
-                {
-                    Assert.Null(result);
-                    Assert.Contains("do not yet support skipping a cached build", job.Error);
-                }
-                else
-                {
-                    Assert.Equal(root, result);
-                    Assert.True(string.IsNullOrEmpty(job.Error));
-                }
+                Assert.Equal(root, result);
+                Assert.True(string.IsNullOrEmpty(job.Error));
+                Assert.False(File.Exists(Path.Combine(root, CiBuildRecord.FileName)));
             }
             finally
             {
@@ -361,9 +379,9 @@ namespace Microsoft.Crank.UnitTests
             build.SetResult();
             Assert.True(Startup.CanDeleteBuildCacheHome(context, job, stopped: true));
             context.BuildAndRunTask = Task.FromCanceled(new CancellationToken(true));
-            Assert.False(Startup.CanDeleteBuildCacheHome(context, job, stopped: true));
-            context.BuildAndRunTask = Task.FromException(new InvalidOperationException("process termination uncertain"));
-            Assert.False(Startup.CanDeleteBuildCacheHome(context, job, stopped: true));
+            Assert.True(Startup.CanDeleteBuildCacheHome(context, job, stopped: true));
+            context.BuildAndRunTask = Task.FromException(new InvalidOperationException("completed build failure"));
+            Assert.True(Startup.CanDeleteBuildCacheHome(context, job, stopped: true));
         }
 
         [Fact]
