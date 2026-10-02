@@ -71,12 +71,12 @@ namespace Microsoft.Crank.Models
         public string UseMonoRuntime { get; set; } = "";
         public bool NoGlobalJson { get; set; }
 
-        // Build Cache Service note: on the "ci" channel BOTH the base runtime (Microsoft.NETCore.App, from
-        // dotnet/runtime) and the ASP.NET Core shared framework (Microsoft.AspNetCore.App, from
-        // dotnet/aspnetcore) are overridden from BCS. Each repo's build is selected via the existing
-        // RuntimeVersion / AspNetCoreVersion arguments, which on this channel carry a commit SHA
-        // (empty = the latest build on main). The "latest" lookup always targets main, since the pipeline
-        // only builds main. RID/config is auto-derived from the agent platform per repo.
+        // CI results retain selectors separately from the actual installed versions and full commits.
+        public string RequestedRuntimeVersion { get; set; }
+        public string RequestedAspNetCoreVersion { get; set; }
+        public string RuntimeCommitSha { get; set; }
+        public string AspNetCoreCommitSha { get; set; }
+        public string BuildFramework { get; set; }
 
         // Delay from the process started to the console receiving "Application started"
         public TimeSpan StartupMainMethod { get; set; }

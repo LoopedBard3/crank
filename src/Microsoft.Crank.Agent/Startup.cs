@@ -1,4 +1,4 @@
-// Licensed to the .NET Foundation under one or more agreements.
+﻿// Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 // See the LICENSE file in the project root for more information.
 
@@ -112,11 +112,6 @@ namespace Microsoft.Crank.Agent
         // Build Cache Service configuration
         private static string _buildCacheBaseUrl = "https://pvscmdupload.z22.web.core.windows.net";
         private static bool _buildCacheEnabled = true;
-
-        // Reuse marker persisted in the (reusable) build temp dir so a reuseBuild cache hit — which skips
-        // the whole build+BCS-resolution step — can still re-resolve current shas and refresh/re-attach the
-        // persistent BCS dotnet home instead of silently running the feed runtime.
-        private const string BuildCacheBuildMetaFileName = ".bcs-build-meta.json";
 
         // Cached lists of SDKs and runtimes already installed
         private static readonly HashSet<string> _installedAspNetRuntimes = new(StringComparer.OrdinalIgnoreCase);
@@ -1039,6 +1034,11 @@ namespace Microsoft.Crank.Agent
                                         {
                                             benchmarksDir = await CloneRestoreAndBuild(tempDir, job, _dotnethome, context, cts.Token);
 
+                                            if (!CanStartJob(job, cts.Token))
+                                            {
+                                                return;
+                                            }
+
                                             if (benchmarksDir == null)
                                             {
                                                 // Build error
@@ -1049,10 +1049,9 @@ namespace Microsoft.Crank.Agent
                                             {
                                                 try
                                                 {
-                                                    // For buildcache jobs the per-job isolated dotnet home holds the
-                                                    // BCS-overlaid runtime; run against it instead of the global home.
+                                                    // CI execution uses the job-private installer home, not the build SDK.
                                                     var runtimeDotnetHome = context.BuildCacheDotnetHome ?? _dotnethome;
-                                                    process = await StartProcess(hostname, Path.Combine(tempDir, benchmarksDir), job, runtimeDotnetHome, context);
+                                                    process = await StartProcess(hostname, Path.Combine(tempDir, benchmarksDir), job, runtimeDotnetHome, context, cts.Token);
 
                                                     Log.Info($"Process started: {job.ProcessId}");
 
@@ -1077,6 +1076,7 @@ namespace Microsoft.Crank.Agent
                                         });
                                     }
 
+                                    context.BuildAndRunTask = buildAndRunTask;
                                     while (job.State != JobState.Failed && !buildAndRunTask.IsCompleted)
                                     {
                                         await Task.Delay(1000);
@@ -1124,7 +1124,7 @@ namespace Microsoft.Crank.Agent
                                         }
                                     }
 
-                                    if (job.State != JobState.Failed)
+                                    if (job.State is JobState.Starting or JobState.Running)
                                     {
                                         startMonitorTime = DateTime.UtcNow;
                                         var lastMonitorTime = startMonitorTime;
@@ -1918,9 +1918,11 @@ namespace Microsoft.Crank.Agent
 
                             async Task DeleteJobAsync()
                             {
+                                var stopped = false;
                                 try
                                 {
                                     await StopJobAsync(abortCollection: true);
+                                    stopped = true;
                                 }
                                 finally
                                 {
@@ -1935,21 +1937,17 @@ namespace Microsoft.Crank.Agent
                                         await TryDeleteDirAsync(tempDir);
                                     }
 
-                                    // Build Cache: clean up per-job extracted artifacts and the isolated
-                                    // dotnet home so concurrent / future jobs do not see stale state and
-                                    // /tmp does not accumulate multi-GB extracts.
-                                    if (_cleanup && !job.NoClean)
+                                    if (_cleanup && !job.NoClean && context.BuildCacheDotnetHome != null)
                                     {
-                                        BuildCacheClient.CleanupExtractDir(context.BuildCacheRuntimeExtractDir);
-                                        BuildCacheClient.CleanupExtractDir(context.BuildCacheAspNetCoreExtractDir);
-
-                                        // NOTE: context.BuildCacheDotnetHome is a persistent, SHA-keyed,
-                                        // LRU-evicted home under BuildCacheClient.HomesRoot — it is shared
-                                        // across reused/concurrent jobs on the same bits and MUST NOT be
-                                        // deleted here. BuildCacheClient evicts old homes on its own.
-                                        context.BuildCacheRuntimeExtractDir = null;
-                                        context.BuildCacheAspNetCoreExtractDir = null;
-                                        context.BuildCacheDotnetHome = null;
+                                        if (CanDeleteBuildCacheHome(context, job, stopped))
+                                        {
+                                            await TryDeleteDirAsync(context.BuildCacheDotnetHome);
+                                            context.BuildCacheDotnetHome = null;
+                                        }
+                                        else
+                                        {
+                                            Log.Info($"Retaining CI home '{context.BuildCacheDotnetHome}': build or process termination could not be confirmed.");
+                                        }
                                     }
 
                                     // Delete temporary attachment files
@@ -2874,255 +2872,44 @@ namespace Microsoft.Crank.Agent
             }
         }
 
-        /// <summary>
-        /// Refreshes BCS state when a previous build folder is reused (the normal build + BCS-resolution
-        /// step is skipped via the early return in <see cref="CloneRestoreAndBuild"/>). Reads the reuse
-        /// marker written at first build, re-resolves the CURRENT per-repo shas (so "latest" advances on
-        /// reuse instead of freezing on the first build's bits), and either re-attaches the still-valid
-        /// persistent SHA-keyed dotnet home / re-materializes it on drift (framework-dependent), or
-        /// re-overlays the drifted framework into the published output (self-contained). Always re-stamps
-        /// the two "+ci.{sha}" reported versions so reused bisection runs stay distinguishable.
-        /// No-op unless the job is on the ci channel, BCS is enabled, and a marker exists (an older
-        /// agent's reuse folder without a marker degrades gracefully to running the previously-built bits).
-        /// </summary>
-        private static async Task RefreshBuildCacheForReuseAsync(
-            string path, string benchmarkedApp, Job job, string dotnetHome, JobContext jobContext, CancellationToken cancellationToken)
-        {
-            if (!String.Equals(job.Channel, "ci", StringComparison.OrdinalIgnoreCase))
-            {
-                return;
-            }
-
-            if (!_buildCacheEnabled)
-            {
-                Log.Info("Build Cache: reuse on ci channel but BCS is disabled on this agent; running previously-built bits.");
-                return;
-            }
-
-            var markerPath = Path.Combine(path, BuildCacheBuildMetaFileName);
-            if (!BuildCacheClient.TryReadBuildMeta(markerPath, out var meta) || meta == null)
-            {
-                Log.Info("Build Cache: no reuse marker found for reused build; running previously-built bits (built by an older agent?).");
-                return;
-            }
-
-            try
-            {
-                // Re-resolve current shas for BOTH repos. An empty pin resolves to main's latest, so a
-                // reused build advances to newer BCS bits; a pinned sha resolves back to itself (idempotent).
-                // The pin is carried by runtimeVersion / aspNetCoreVersion on the ci channel.
-                if (!BuildCacheClient.TryResolveCiVersionPin(job.RuntimeVersion, "runtimeVersion", out var runtimeCommitPin, out var runtimePinError))
-                {
-                    throw new InvalidOperationException(runtimePinError);
-                }
-                if (!BuildCacheClient.TryResolveCiVersionPin(job.AspNetCoreVersion, "aspNetCoreVersion", out var aspNetCoreCommitPin, out var aspNetCorePinError))
-                {
-                    throw new InvalidOperationException(aspNetCorePinError);
-                }
-
-                var runtimeResolved = await BuildCacheClient.ResolveCommitAsync(
-                    _buildCacheBaseUrl, BuildCacheClient.RepoNameRuntime, "main", runtimeCommitPin, null, cancellationToken);
-
-                var aspNetResolved = await BuildCacheClient.ResolveCommitAsync(
-                    _buildCacheBaseUrl, BuildCacheClient.RepoNameAspNetCore, "main", aspNetCoreCommitPin, null, cancellationToken);
-
-                var curRuntimeSha = runtimeResolved.commitSha;
-                var curAspNetSha = aspNetResolved.commitSha;
-
-                var runtimeDrift = !string.Equals(curRuntimeSha, meta.RuntimeCommitSha, StringComparison.OrdinalIgnoreCase);
-                var aspNetDrift = !string.Equals(curAspNetSha, meta.AspNetCoreCommitSha, StringComparison.OrdinalIgnoreCase);
-
-                if (!meta.SelfContained)
-                {
-                    // Framework-dependent: (re)attach the persistent SHA-keyed dotnet home so StartProcess
-                    // runs the intended BCS bits (the per-job temp home is gone after the first job's cleanup).
-                    var key = BuildCacheClient.ComputeHomeCacheKey(
-                        curRuntimeSha, curAspNetSha, meta.RuntimeVersion, meta.AspNetCoreVersion, meta.Rid);
-
-                    if (BuildCacheClient.TryGetCachedDotnetHome(key, out var cachedHome))
-                    {
-                        // Exact bits already materialized (this run's shas, possibly by another job) — attach.
-                        if (jobContext != null)
-                        {
-                            jobContext.BuildCacheDotnetHome = cachedHome;
-                        }
-
-                        Log.Info($"Build Cache: reuse attached persistent home for runtime {BuildCacheClient.ShortSha(curRuntimeSha)} + aspnetcore {BuildCacheClient.ShortSha(curAspNetSha)} (key '{key}').");
-                    }
-                    else
-                    {
-                        // Drift (or LRU eviction of the exact-match home): materialize a new home. Prefer the
-                        // first-build home as the base so only the drifted repo's archive is downloaded; fall
-                        // back to the global home (download both) if the first-build home was evicted.
-                        var firstKey = BuildCacheClient.ComputeHomeCacheKey(
-                            meta.RuntimeCommitSha, meta.AspNetCoreCommitSha, meta.RuntimeVersion, meta.AspNetCoreVersion, meta.Rid);
-                        var haveFirstHome = BuildCacheClient.TryGetCachedDotnetHome(firstKey, out var firstHome);
-                        var baseHome = haveFirstHome ? firstHome : dotnetHome;
-
-                        string runtimeExtract = null;
-                        string aspNetExtract = null;
-
-                        // With the first-build home as base, only re-download the side(s) that drifted (the
-                        // non-drifted side is cloned from the base home). Without it, rebuild both from scratch.
-                        if (!haveFirstHome || runtimeDrift)
-                        {
-                            runtimeExtract = await BuildCacheClient.DownloadAndExtractAsync(
-                                _buildCacheBaseUrl, BuildCacheClient.RepoNameRuntime, curRuntimeSha, runtimeResolved.buildCacheConfig, cancellationToken);
-                        }
-                        if (!haveFirstHome || aspNetDrift)
-                        {
-                            aspNetExtract = await BuildCacheClient.DownloadAndExtractAsync(
-                                _buildCacheBaseUrl, BuildCacheClient.RepoNameAspNetCore, curAspNetSha, aspNetResolved.buildCacheConfig, cancellationToken);
-                        }
-
-                        var bcsHome = BuildCacheClient.EnsureBuildCacheDotnetHome(
-                            baseHome,
-                            meta.RuntimeVersion,
-                            meta.AspNetCoreVersion,
-                            runtimeExtract,
-                            curRuntimeSha,
-                            runtimeResolved.buildCacheConfig,
-                            aspNetExtract,
-                            curAspNetSha,
-                            aspNetResolved.buildCacheConfig,
-                            meta.Rid);
-
-                        if (jobContext != null)
-                        {
-                            jobContext.BuildCacheDotnetHome = bcsHome;
-                            jobContext.BuildCacheRuntimeExtractDir = runtimeExtract;
-                            jobContext.BuildCacheAspNetCoreExtractDir = aspNetExtract;
-                        }
-
-                        Log.Info($"Build Cache: reuse re-materialized persistent home (drift runtime={runtimeDrift}, aspnetcore={aspNetDrift}) key '{key}'.");
-                    }
-                }
-                else if (runtimeDrift || aspNetDrift)
-                {
-                    // Self-contained: the frameworks are baked into the reused published output. Re-overlay
-                    // only the side(s) that drifted so the reused publish reflects the current "latest".
-                    var outputFolder = String.IsNullOrEmpty(job.Executable)
-                        ? Path.Combine(benchmarkedApp, "published")
-                        : benchmarkedApp;
-
-                    var publishProjectFileName = Path.Combine(benchmarkedApp, FormatPathSeparators(job.Project));
-                    var assemblyName = GetAssemblyName(job, publishProjectFileName);
-
-                    if (runtimeDrift)
-                    {
-                        var runtimeExtract = await BuildCacheClient.DownloadAndExtractAsync(
-                            _buildCacheBaseUrl, BuildCacheClient.RepoNameRuntime, curRuntimeSha, runtimeResolved.buildCacheConfig, cancellationToken);
-                        BuildCacheClient.OverlayPublishedOutput(
-                            runtimeExtract, outputFolder, runtimeResolved.buildCacheConfig, assemblyName, BuildCacheClient.BuildCacheFlavor.Runtime);
-                        if (jobContext != null)
-                        {
-                            jobContext.BuildCacheRuntimeExtractDir = runtimeExtract;
-                        }
-                    }
-
-                    if (aspNetDrift)
-                    {
-                        var aspNetExtract = await BuildCacheClient.DownloadAndExtractAsync(
-                            _buildCacheBaseUrl, BuildCacheClient.RepoNameAspNetCore, curAspNetSha, aspNetResolved.buildCacheConfig, cancellationToken);
-                        BuildCacheClient.OverlayPublishedOutput(
-                            aspNetExtract, outputFolder, aspNetResolved.buildCacheConfig, assemblyName, BuildCacheClient.BuildCacheFlavor.AspNetCore);
-                        if (jobContext != null)
-                        {
-                            jobContext.BuildCacheAspNetCoreExtractDir = aspNetExtract;
-                        }
-                    }
-
-                    Log.Info($"Build Cache: reuse re-overlaid self-contained publish (drift runtime={runtimeDrift}, aspnetcore={aspNetDrift}).");
-                }
-
-                // Re-stamp the reported versions from the marker's feed versions + the current shas so reused
-                // runs are distinguishable and reflect any latest-advance (matches the fresh-build stamping).
-                if (!string.IsNullOrEmpty(curRuntimeSha))
-                {
-                    job.RuntimeVersion = $"{meta.RuntimeVersion}+ci.{BuildCacheClient.ShortSha(curRuntimeSha)}";
-                }
-                if (!string.IsNullOrEmpty(curAspNetSha))
-                {
-                    job.AspNetCoreVersion = $"{meta.AspNetCoreVersion}+ci.{BuildCacheClient.ShortSha(curAspNetSha)}";
-                }
-
-                // Record the reported versions as result measurements carrying the "+ci.{sha}" stamp. The reuse
-                // path returns before the fresh-build measurement recording, so without this a reused ci run would
-                // surface no netCoreAppVersion/aspNetCoreVersion at all. Using the existing keys keeps reused and
-                // fresh ci runs identical in the results (and in the SQL/ES document). Gated implicitly on the ci
-                // channel via the non-empty resolved shas.
-                RecordBuildCacheCiVersionMeasurement(
-                    job, Measurements.BenchmarksAspNetCoreVersion, "ASP.NET Core Version", meta.AspNetCoreVersion, curAspNetSha);
-                RecordBuildCacheCiVersionMeasurement(
-                    job, Measurements.BenchmarksNetCoreAppVersion, ".NET Runtime Version", meta.RuntimeVersion, curRuntimeSha);
-
-                // Refresh the marker so a subsequent reuse compares against the shas we just applied.
-                if (runtimeDrift || aspNetDrift)
-                {
-                    try
-                    {
-                        meta.RuntimeCommitSha = curRuntimeSha;
-                        meta.AspNetCoreCommitSha = curAspNetSha;
-                        BuildCacheClient.WriteBuildMeta(markerPath, meta);
-                    }
-                    catch (Exception metaEx)
-                    {
-                        Log.Info($"Build Cache: could not update reuse marker (non-fatal): {metaEx.Message}");
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                // Fail loud: a buildcache job that cannot refresh its bits on reuse must not silently run the
-                // wrong (feed) runtime.
-                job.Error = $"Build Cache: failed to refresh reused build: {ex.Message}";
-            }
-        }
-
-        /// <summary>
-        /// Records a result measurement carrying the "+ci.{sha}" build-cache stamp (feed version + resolved BCS
-        /// commit truncated to <see cref="CommitHashLength"/> chars) under the given key. Used by the reuse path,
-        /// which returns before the fresh-build version recording, to surface the AspNetCoreVersion/NetCoreAppVersion
-        /// measurements for reused ci runs. No-op when the sha is empty or the key was already recorded this job.
-        /// </summary>
-        private static void RecordBuildCacheCiVersionMeasurement(Job job, string measurementName, string description, string feedVersion, string commitSha)
-        {
-            if (string.IsNullOrEmpty(commitSha))
-            {
-                return;
-            }
-
-            if (job.Metadata.Any(x => x.Name == measurementName))
-            {
-                return;
-            }
-
-            job.Metadata.Enqueue(new MeasurementMetadata
-            {
-                Source = "Host Process",
-                Name = measurementName,
-                Aggregate = Operation.First, // Use first as iterations won't repeat it in next runs
-                Reduce = Operation.First,
-                Format = "",
-                LongDescription = description,
-                ShortDescription = description
-            });
-
-            // Truncate to 12 chars (CommitHashLength) so the reuse-path value matches the fresh-build
-            // AspNetCoreVersion/NetCoreAppVersion (.version-file) measurements, which are also 12-char.
-            // (The internal job.RuntimeVersion/AspNetCoreVersion DTO stamp keeps its 8-char ShortSha.)
-            var shortSha = commitSha.Length >= CommitHashLength ? commitSha.Substring(0, CommitHashLength) : commitSha;
-
-            job.Measurements.Enqueue(new Measurement
-            {
-                Name = measurementName,
-                Timestamp = DateTime.UtcNow,
-                Value = $"{feedVersion}+ci.{shortSha}"
-            });
-        }
-
         private static async Task<string> CloneRestoreAndBuild(string path, Job job, string dotnetHome, JobContext jobContext = null, CancellationToken cancellationToken = default)
         {
+            var runtimeSelector = BuildCacheClient.GetSelector(job.RuntimeVersion, job.Channel);
+            var aspNetCoreSelector = BuildCacheClient.GetSelector(job.AspNetCoreVersion, job.Channel);
+            var useCiRuntime = BuildCacheClient.IsCiSelector(runtimeSelector);
+            var useCiAspNetCore = BuildCacheClient.IsCiSelector(aspNetCoreSelector);
+            var useBuildCache = useCiRuntime || useCiAspNetCore;
+            if (useBuildCache || String.Equals(job.Channel, "ci", StringComparison.OrdinalIgnoreCase))
+            {
+                BuildCacheClient.ValidateSelector(runtimeSelector);
+                BuildCacheClient.ValidateSelector(aspNetCoreSelector);
+            }
+            if (useBuildCache)
+            {
+                if (!_buildCacheEnabled)
+                {
+                    job.Error = "CI runtimes were requested but BCS is disabled (--build-cache-disabled).";
+                    return null;
+                }
+                if (jobContext == null)
+                {
+                    throw new InvalidOperationException("CI installation requires a job-owned runtime home.");
+                }
+                if (!string.IsNullOrEmpty(job.UseMonoRuntime) && !string.Equals(job.UseMonoRuntime, "false", StringComparison.OrdinalIgnoreCase))
+                {
+                    job.Error = "CI installers contain CoreCLR runtime builds; useMonoRuntime would replace the selected bits and is not supported.";
+                    return null;
+                }
+                if (job.SelfContained && (!string.IsNullOrEmpty(job.Executable) || string.IsNullOrEmpty(job.Project)))
+                {
+                    job.Error = "CI self-contained jobs require a project publish without an executable override so the selected runtime packs are used.";
+                    return null;
+                }
+
+                job.RequestedRuntimeVersion = job.RuntimeVersion;
+                job.RequestedAspNetCoreVersion = job.AspNetCoreVersion;
+            }
+
             var reuseFolder = await RetrieveSourcesAsync(job, path);
 
 
@@ -3144,6 +2931,11 @@ namespace Microsoft.Crank.Agent
 
             if (!requireDotnetBuild)
             {
+                if (useBuildCache)
+                {
+                    job.Error = "CI runtimes require a .NET project or executable: dotnet.";
+                    return null;
+                }
                 Log.Info("Skipping build step, not required");
                 return path;
             }
@@ -3153,14 +2945,12 @@ namespace Microsoft.Crank.Agent
 
             if (!requireDotnetBuild)
             {
+                if (useBuildCache)
+                {
+                    job.Error = "CI installer runtimes do not yet support skipping a cached build. Disable reuseBuild/noBuild; source caching and fresh builds with a buildKey are supported.";
+                    return null;
+                }
                 Log.Info("Skipping build step, reusing previous build");
-
-                // The reused build folder is being reattached without re-running the build/BCS-resolution
-                // step. For the ci channel that means re-resolving current shas and refreshing (or
-                // re-attaching) the persistent SHA-keyed dotnet home so a framework-dependent job runs the
-                // intended BCS bits (not the feed runtime) and "latest" picks up newer builds on reuse.
-                await RefreshBuildCacheForReuseAsync(path, benchmarkedApp, job, dotnetHome, jobContext, cancellationToken);
-
                 return path;
             }
 
@@ -3225,155 +3015,52 @@ namespace Microsoft.Crank.Agent
                 }
             }
 
-            // Build Cache Service: on the "ci" channel BOTH the base runtime (Microsoft.NETCore.App, from
-            // dotnet/runtime) and the ASP.NET Core shared framework (Microsoft.AspNetCore.App, from
-            // dotnet/aspnetcore) are overridden from BCS. Each repo's build is selected via the existing
-            // runtimeVersion / aspNetCoreVersion arguments, which on this channel carry a commit SHA (empty
-            // = the latest build on the branch) rather than a feed version; a sha pins/bisects that repo
-            // while the other stays latest.
-            var isBuildCacheChannel = String.Equals(channel, "ci", StringComparison.OrdinalIgnoreCase);
-            var useBuildCache = isBuildCacheChannel;
+            var buildChannel = String.Equals(channel, "ci", StringComparison.OrdinalIgnoreCase) ? "latest" : channel;
+            runtimeVersion = await ResolveRuntimeVersion(buildToolsPath, targetFramework,
+                useCiRuntime ? buildChannel : string.IsNullOrEmpty(runtimeVersion) ? channel : runtimeVersion);
+            aspNetCoreVersion = await ResolveAspNetCoreVersion(
+                useCiAspNetCore ? buildChannel : string.IsNullOrEmpty(aspNetCoreVersion) ? channel : aspNetCoreVersion, targetFramework);
+            desktopVersion = string.IsNullOrEmpty(desktopVersion) ? buildChannel : desktopVersion;
+            sdkVersion = await ResolveSdkVersion(string.IsNullOrEmpty(sdkVersion) ? buildChannel : sdkVersion, targetFramework);
 
-            if (isBuildCacheChannel)
+            // Compilation inputs remain feed/SDK versions, never commit-derived execution versions.
+            var buildRuntimeVersion = runtimeVersion;
+            var buildAspNetCoreVersion = aspNetCoreVersion;
+            if (useBuildCache && !job.SelfContained &&
+                (string.IsNullOrEmpty(buildRuntimeVersion) || string.IsNullOrEmpty(buildAspNetCoreVersion)))
             {
-                // On the ci channel runtimeVersion carries a Build Cache commit pin (or empty = latest), not
-                // a feed version. The base runtime FOLDER is always the latest feed version (BCS bits overlay
-                // on top), so force "latest" here; the pin is parsed from job.RuntimeVersion in the
-                // useBuildCache block below. This also keeps a SHA from leaking into ResolveRuntimeVersion.
-                runtimeVersion = "latest";
+                throw new InvalidOperationException($"Could not resolve feed-based compilation versions for '{targetFramework}' on channel '{buildChannel}'.");
             }
-            else if (String.IsNullOrEmpty(runtimeVersion))
-            {
-                runtimeVersion = channel;
-            }
-
-            // For the ci channel, the components NOT overridden by BCS use "latest" from feeds.
-            var nonRuntimeChannel = isBuildCacheChannel ? "latest" : channel;
-
-            if (String.IsNullOrEmpty(desktopVersion))
-            {
-                desktopVersion = nonRuntimeChannel;
-            }
-
-            if (isBuildCacheChannel)
-            {
-                // Same as runtimeVersion: on the ci channel aspNetCoreVersion carries a commit pin, not a
-                // feed version. The ASP.NET Core shared-framework FOLDER name is feed-resolved to latest; the
-                // CONTENTS are placed directly from the BCS pack. Force "latest"; the pin is parsed below.
-                aspNetCoreVersion = "latest";
-            }
-            else if (String.IsNullOrEmpty(aspNetCoreVersion))
-            {
-                aspNetCoreVersion = nonRuntimeChannel;
-            }
-
-            if (String.IsNullOrEmpty(sdkVersion))
-            {
-                sdkVersion = nonRuntimeChannel;
-            }
-
-            runtimeVersion = await ResolveRuntimeVersion(buildToolsPath, targetFramework, runtimeVersion);
-
-            // Per-repo BCS resolution outputs (both frameworks are always overridden on the ci channel).
-            string runtimeBuildCacheCommitSha = null;
-            string aspNetCoreBuildCacheCommitSha = null;
-            string runtimeBuildCacheExtractDir = null;
-            string aspNetCoreBuildCacheExtractDir = null;
-            string runtimeBuildCacheConfigResolved = null;
-            string aspNetCoreBuildCacheConfigResolved = null;
-
-            // Persistent (SHA-keyed) dotnet-home cache bookkeeping. buildCacheHomeCached lets a
-            // framework-dependent build attach an existing home and skip the archive download.
-            string buildCacheHomeKey = null;
-            string buildCacheHomePath = null;
-            string buildCacheRid = null;
-            bool buildCacheHomeCached = false;
-
+            BuildCacheClient.ResolvedBuild ciRuntime = null;
+            BuildCacheClient.ResolvedBuild ciAspNetCore = null;
+            var runtimeHomeDir = dotnetHome;
+            var aspNetCoreHomeDir = dotnetHome;
             if (useBuildCache)
             {
-                if (!_buildCacheEnabled)
+                if (useCiRuntime)
                 {
-                    job.Error = "Build Cache channel was requested but Build Cache Service is disabled on this agent (--build-cache-disabled).";
-                    return null;
+                    ciRuntime = await BuildCacheClient.ResolveAsync(_httpClient, _buildCacheBaseUrl, "runtime", runtimeSelector, GetPlatformMoniker(), cancellationToken);
+                    runtimeVersion = ciRuntime.Version;
+                }
+                if (useCiAspNetCore)
+                {
+                    ciAspNetCore = await BuildCacheClient.ResolveAsync(_httpClient, _buildCacheBaseUrl, "aspnetcore", aspNetCoreSelector, GetPlatformMoniker(), cancellationToken);
+                    aspNetCoreVersion = ciAspNetCore.Version;
                 }
 
-                // On the ci channel runtimeVersion / aspNetCoreVersion carry a Build Cache commit pin (empty
-                // = latest build on the branch). Parse them here and fail with a clear message if a version
-                // string was supplied instead of a SHA.
-                if (!BuildCacheClient.TryResolveCiVersionPin(job.RuntimeVersion, "runtimeVersion", out var runtimeCommitPin, out var runtimePinError))
-                {
-                    job.Error = runtimePinError;
-                    return null;
-                }
-
-                if (!BuildCacheClient.TryResolveCiVersionPin(job.AspNetCoreVersion, "aspNetCoreVersion", out var aspNetCoreCommitPin, out var aspNetCorePinError))
-                {
-                    job.Error = aspNetCorePinError;
-                    return null;
-                }
-
-                try
-                {
-                    // Resolve BOTH repos' commits + configs first (cheap JSON lookups). The heavy archive
-                    // download is deferred until we know whether a persistent SHA-keyed home already covers
-                    // this exact (runtime sha, aspnet sha, versions, rid) combination.
-                    // ResolveCommitAsync/DownloadAndExtractAsync derive the flavour (config map + RepoName
-                    // path segment) from the repoName we pass, so each repo routes to its own BCS blobs.
-                    var runtimeResolved = await BuildCacheClient.ResolveCommitAsync(
-                        _buildCacheBaseUrl, BuildCacheClient.RepoNameRuntime, "main", runtimeCommitPin, null, cancellationToken);
-                    runtimeBuildCacheCommitSha = runtimeResolved.commitSha;
-                    runtimeBuildCacheConfigResolved = runtimeResolved.buildCacheConfig;
-
-                    var aspNetResolved = await BuildCacheClient.ResolveCommitAsync(
-                        _buildCacheBaseUrl, BuildCacheClient.RepoNameAspNetCore, "main", aspNetCoreCommitPin, null, cancellationToken);
-                    aspNetCoreBuildCacheCommitSha = aspNetResolved.commitSha;
-                    aspNetCoreBuildCacheConfigResolved = aspNetResolved.buildCacheConfig;
-
-                    // Resolve REAL feed versions (folder names). The base runtime overlay borrows the feed's
-                    // deps.json/runtimeconfig.json; the ASP.NET Core framework folder name must be a real feed
-                    // version even though its CONTENTS are placed directly from the BCS pack.
-                    runtimeVersion = await ResolveRuntimeVersion(buildToolsPath, targetFramework, "Latest");
-                    aspNetCoreVersion = await ResolveAspNetCoreVersion("Latest", targetFramework);
-
-                    // Persistent home cache key is derived from the CONCRETE resolved shas (never "latest"), so
-                    // when "latest" advances a reused job re-resolves to a new sha, computes a new key, and picks
-                    // up the newer bits instead of freezing on the first build's bits.
-                    buildCacheRid = GetPlatformMoniker();
-                    buildCacheHomeKey = BuildCacheClient.ComputeHomeCacheKey(
-                        runtimeBuildCacheCommitSha, aspNetCoreBuildCacheCommitSha, runtimeVersion, aspNetCoreVersion, buildCacheRid);
-                    buildCacheHomeCached = BuildCacheClient.TryGetCachedDotnetHome(buildCacheHomeKey, out buildCacheHomePath);
-
-                    // A framework-dependent build can attach the cached home and skip the archive download
-                    // entirely. Self-contained builds must always download because the BCS bits are overlaid
-                    // into the freshly-published output (not served from the persistent home).
-                    if (!buildCacheHomeCached || job.SelfContained)
-                    {
-                        runtimeBuildCacheExtractDir = await BuildCacheClient.DownloadAndExtractAsync(
-                            _buildCacheBaseUrl, BuildCacheClient.RepoNameRuntime, runtimeBuildCacheCommitSha, runtimeBuildCacheConfigResolved, cancellationToken);
-                        aspNetCoreBuildCacheExtractDir = await BuildCacheClient.DownloadAndExtractAsync(
-                            _buildCacheBaseUrl, BuildCacheClient.RepoNameAspNetCore, aspNetCoreBuildCacheCommitSha, aspNetCoreBuildCacheConfigResolved, cancellationToken);
-                        Log.Info($"Build Cache: runtime {runtimeVersion} (feed) overlaid with BCS {BuildCacheClient.ShortSha(runtimeBuildCacheCommitSha)}; ASP.NET Core {aspNetCoreVersion} placed directly from BCS {BuildCacheClient.ShortSha(aspNetCoreBuildCacheCommitSha)}");
-                    }
-                    else
-                    {
-                        Log.Info($"Build Cache: persistent home already covers runtime {BuildCacheClient.ShortSha(runtimeBuildCacheCommitSha)} + aspnetcore {BuildCacheClient.ShortSha(aspNetCoreBuildCacheCommitSha)} (key '{buildCacheHomeKey}'); skipping archive download.");
-                    }
-                }
-                catch (Exception ex)
-                {
-                    job.Error = $"Build Cache: {ex.Message}";
-                    return null;
-                }
+                runtimeHomeDir = Path.Combine(_rootTempDir, $"ci-dotnet-{Guid.NewGuid():N}");
+                jobContext.BuildCacheDotnetHome = runtimeHomeDir;
+                Directory.CreateDirectory(runtimeHomeDir);
+                // ASP.NET's canonical archive bundles NETCore and host files. Install separately
+                // so even a same-version bundled runtime cannot replace the selected runtime commit.
+                aspNetCoreHomeDir = Path.Combine(runtimeHomeDir, "aspnetcore-install");
             }
-
-            sdkVersion = await ResolveSdkVersion(sdkVersion, targetFramework);
-
-            aspNetCoreVersion = await ResolveAspNetCoreVersion(aspNetCoreVersion, targetFramework);
 
             sdkVersion = PatchOrCreateGlobalJson(job, benchmarkedApp, sdkVersion);
 
             // Patch NuGet.config to ensure crank sources are included in packageSourceMapping
-            PatchNuGetConfig(benchmarkedApp);
+            if (!useBuildCache)
+                PatchNuGetConfig(benchmarkedApp);
 
             var dotnetInstallStep = "";
             string dotnetFeed = "";
@@ -3416,31 +3103,22 @@ namespace Microsoft.Crank.Agent
                         _installedSdks.Add(sdkVersion);
                     }
 
-                    if (!_installedDotnetRuntimes.Contains(runtimeVersion))
+                    if (useBuildCache || !_installedDotnetRuntimes.Contains(runtimeVersion))
                     {
                         dotnetInstallStep = $"Runtime '{runtimeVersion}'";
                         Log.Info($"Installing {dotnetInstallStep} ...");
 
                         // Install runtimes required for this scenario
 
-                        if (!TryGetAzureFeedForPackage(PackageTypes.NetCoreApp, runtimeVersion, out dotnetFeed))
+                        dotnetFeed = ciRuntime?.AzureFeed;
+                        if (dotnetFeed == null && !TryGetAzureFeedForPackage(PackageTypes.NetCoreApp, runtimeVersion, out dotnetFeed))
                         {
                             throw new InvalidOperationException();
                         }
 
-                        var result = await ProcessUtil.RunAsync(_pwsh, $"-NoProfile -ExecutionPolicy unrestricted -Command \"[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Unblock-File -Path .\\dotnet-install.ps1; .\\dotnet-install.ps1 -Version {runtimeVersion} -Runtime dotnet -NoPath -SkipNonVersionedFiles -InstallDir {dotnetHome} -AzureFeed {dotnetFeed}\"",
-                                log: false,
-                                throwOnError: false,
-                                workingDirectory: _dotnetInstallPath,
-                                environmentVariables: env,
-                                cancellationToken: cancellationToken);
-
-                        if (result.ExitCode != 0)
-                        {
-                            throw new InvalidOperationException();
-                        }
-
-                        _installedDotnetRuntimes.Add(runtimeVersion);
+                        await InstallFrameworkAsync(runtimeVersion, "dotnet", runtimeHomeDir, dotnetFeed, env, cancellationToken);
+                        if (!useBuildCache)
+                            _installedDotnetRuntimes.Add(runtimeVersion);
                     }
 
                     try
@@ -3492,31 +3170,22 @@ namespace Microsoft.Crank.Agent
                         desktopVersion = SeekCompatibleDesktopRuntime(dotnetHome, targetFramework, desktopVersion);
                     }
 
-                    if (!_installedAspNetRuntimes.Contains(aspNetCoreVersion))
+                    if (useBuildCache || !_installedAspNetRuntimes.Contains(aspNetCoreVersion))
                     {
                         dotnetInstallStep = $"ASP.NET runtime '{aspNetCoreVersion}'";
                         Log.Info($"Installing {dotnetInstallStep} ...");
 
                         // Install aspnet runtime required for this scenario
 
-                        if (!TryGetAzureFeedForPackage(PackageTypes.AspNetCore, aspNetCoreVersion, out dotnetFeed))
+                        dotnetFeed = ciAspNetCore?.AzureFeed;
+                        if (dotnetFeed == null && !TryGetAzureFeedForPackage(PackageTypes.AspNetCore, aspNetCoreVersion, out dotnetFeed))
                         {
                             throw new InvalidOperationException();
                         }
 
-                        var result = await ProcessUtil.RunAsync(_pwsh, $"-NoProfile -ExecutionPolicy unrestricted -Command \"[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Unblock-File -Path .\\dotnet-install.ps1; .\\dotnet-install.ps1 -Version {aspNetCoreVersion} -Runtime aspnetcore -NoPath -SkipNonVersionedFiles -InstallDir {dotnetHome} -AzureFeed {dotnetFeed}\"",
-                                log: false,
-                                throwOnError: false,
-                                workingDirectory: _dotnetInstallPath,
-                                environmentVariables: env,
-                                cancellationToken: cancellationToken);
-
-                        if (result.ExitCode != 0)
-                        {
-                            throw new InvalidOperationException();
-                        }
-
-                        _installedAspNetRuntimes.Add(aspNetCoreVersion);
+                        await InstallFrameworkAsync(aspNetCoreVersion, "aspnetcore", aspNetCoreHomeDir, dotnetFeed, env, cancellationToken);
+                        if (!useBuildCache)
+                            _installedAspNetRuntimes.Add(aspNetCoreVersion);
                     }
                 }
                 else
@@ -3553,64 +3222,46 @@ namespace Microsoft.Crank.Agent
                         _installedSdks.Add(sdkVersion);
                     }
 
-                    if (!_installedDotnetRuntimes.Contains(runtimeVersion))
+                    if (useBuildCache || !_installedDotnetRuntimes.Contains(runtimeVersion))
                     {
                         dotnetInstallStep = $"Runtime '{runtimeVersion}'";
                         Log.Info($"Installing {dotnetInstallStep} ...");
 
                         // Install required runtime
 
-                        if (!TryGetAzureFeedForPackage(PackageTypes.NetCoreApp, runtimeVersion, out dotnetFeed))
+                        dotnetFeed = ciRuntime?.AzureFeed;
+                        if (dotnetFeed == null && !TryGetAzureFeedForPackage(PackageTypes.NetCoreApp, runtimeVersion, out dotnetFeed))
                         {
                             throw new InvalidOperationException();
                         }
 
-                        ProcessResult result = await ProcessUtil.RunAsync("/usr/bin/env", $"bash dotnet-install.sh --version {runtimeVersion} --runtime dotnet --no-path --skip-non-versioned-files --install-dir {dotnetHome} -AzureFeed {dotnetFeed}",
-                                log: false,
-                                throwOnError: false,
-                                workingDirectory: _dotnetInstallPath,
-                                environmentVariables: env,
-                                cancellationToken: cancellationToken);
-
-                        if (result.ExitCode != 0)
-                        {
-                            throw new InvalidOperationException();
-                        }
-
-                        _installedDotnetRuntimes.Add(runtimeVersion);
+                        await InstallFrameworkAsync(runtimeVersion, "dotnet", runtimeHomeDir, dotnetFeed, env, cancellationToken);
+                        if (!useBuildCache)
+                            _installedDotnetRuntimes.Add(runtimeVersion);
                     }
 
-                    if (!_installedAspNetRuntimes.Contains(aspNetCoreVersion))
+                    if (useBuildCache || !_installedAspNetRuntimes.Contains(aspNetCoreVersion))
                     {
                         dotnetInstallStep = $"ASP.NET runtime '{aspNetCoreVersion}'";
                         Log.Info($"Installing {dotnetInstallStep} ...");
 
                         // Install required runtime
 
-                        if (!TryGetAzureFeedForPackage(PackageTypes.AspNetCore, aspNetCoreVersion, out dotnetFeed))
+                        dotnetFeed = ciAspNetCore?.AzureFeed;
+                        if (dotnetFeed == null && !TryGetAzureFeedForPackage(PackageTypes.AspNetCore, aspNetCoreVersion, out dotnetFeed))
                         {
                             throw new InvalidOperationException();
                         }
 
-                        ProcessResult result = await ProcessUtil.RunAsync("/usr/bin/env", $"bash dotnet-install.sh --version {aspNetCoreVersion} --runtime aspnetcore --no-path --skip-non-versioned-files --install-dir {dotnetHome} -AzureFeed {dotnetFeed}",
-                                log: false,
-                                throwOnError: false,
-                                workingDirectory: _dotnetInstallPath,
-                                environmentVariables: env,
-                                cancellationToken: cancellationToken);
-
-                        if (result.ExitCode != 0)
-                        {
-                            throw new InvalidOperationException();
-                        }
-
-                        _installedAspNetRuntimes.Add(aspNetCoreVersion);
+                        await InstallFrameworkAsync(aspNetCoreVersion, "aspnetcore", aspNetCoreHomeDir, dotnetFeed, env, cancellationToken);
+                        if (!useBuildCache)
+                            _installedAspNetRuntimes.Add(aspNetCoreVersion);
                     }
                 }
             }
-            catch
+            catch (Exception ex)
             {
-                job.Error = $"dotnet-install could not install a component: {dotnetInstallStep}";
+                job.Error = $"dotnet-install could not install a component: {dotnetInstallStep}. {ex.Message}";
 
                 return null;
             }
@@ -3622,74 +3273,17 @@ namespace Microsoft.Crank.Agent
 
             var dotnetDir = dotnetHome;
 
-            // Build Cache: build a per-job dotnet home that contains BCS-overlaid runtime + asp.net
-            // + host. We DO NOT mutate the global dotnet home — concurrent jobs and subsequent
-            // non-buildcache jobs must remain unaffected. The publish step continues to use the
-            // global dotnetDir (it has the SDK); only the runtime-resolution paths (metadata
-            // reading, crossgen/symbols emit, StartProcess) point at the per-job home.
-            var runtimeHomeDir = dotnetDir;
-
             if (useBuildCache)
             {
-                try
-                {
-                    // EnsureBuildCacheDotnetHome no-ops and returns the existing home on a cache hit
-                    // (keyed by the concrete shas + versions + rid), or atomically materializes a new one
-                    // on a miss. The home lives under a shared LRU-evicted root, NOT the per-job temp dir,
-                    // so it survives job cleanup and is shared across reused/other jobs on the same bits.
-                    var bcsHome = BuildCacheClient.EnsureBuildCacheDotnetHome(
-                        dotnetDir,
-                        runtimeVersion,
-                        aspNetCoreVersion,
-                        runtimeBuildCacheExtractDir,
-                        runtimeBuildCacheCommitSha,
-                        runtimeBuildCacheConfigResolved,
-                        aspNetCoreBuildCacheExtractDir,
-                        aspNetCoreBuildCacheCommitSha,
-                        aspNetCoreBuildCacheConfigResolved,
-                        buildCacheRid);
+                if (ciRuntime != null)
+                    BuildCacheClient.ValidateInstallation(runtimeHomeDir, "Microsoft.NETCore.App", ciRuntime);
+                if (ciAspNetCore != null)
+                    BuildCacheClient.ValidateInstallation(aspNetCoreHomeDir, "Microsoft.AspNetCore.App", ciAspNetCore);
 
-                    runtimeHomeDir = bcsHome;
-
-                    // Stash on the JobContext so StartProcess uses this isolated home (FDD). The home is
-                    // persistent/LRU-managed, so cleanup must NOT delete it (only the extract dirs).
-                    if (jobContext != null)
-                    {
-                        jobContext.BuildCacheDotnetHome = bcsHome;
-                        jobContext.BuildCacheRuntimeExtractDir = runtimeBuildCacheExtractDir;
-                        jobContext.BuildCacheAspNetCoreExtractDir = aspNetCoreBuildCacheExtractDir;
-                    }
-
-                    // Persist a reuse marker next to the (reusable) build folder capturing the CONCRETE feed
-                    // versions + rid + shas resolved here. On a reuseBuild cache hit the build step is skipped
-                    // before any BCS resolution runs, so the early-return handler reads this marker to
-                    // re-resolve current shas, re-attach/refresh the persistent home, and re-stamp versions.
-                    try
-                    {
-                        BuildCacheClient.WriteBuildMeta(
-                            Path.Combine(path, BuildCacheBuildMetaFileName),
-                            new BuildCacheClient.BuildCacheBuildMeta
-                            {
-                                RuntimeVersion = runtimeVersion,
-                                AspNetCoreVersion = aspNetCoreVersion,
-                                Rid = buildCacheRid,
-                                SelfContained = job.SelfContained,
-                                RuntimeCommitSha = runtimeBuildCacheCommitSha,
-                                AspNetCoreCommitSha = aspNetCoreBuildCacheCommitSha,
-                            });
-                    }
-                    catch (Exception metaEx)
-                    {
-                        Log.Info($"Build Cache: could not write reuse marker (non-fatal): {metaEx.Message}");
-                    }
-
-                    Log.Info($"Build Cache: Isolated dotnet home: {bcsHome}");
-                }
-                catch (Exception ex)
-                {
-                    job.Error = $"Build Cache: failed to build isolated dotnet home: {ex.Message}";
-                    return null;
-                }
+                BuildCacheClient.PromoteAspNetCoreFramework(runtimeHomeDir, aspNetCoreHomeDir);
+                await TryDeleteDirAsync(aspNetCoreHomeDir);
+                job.RuntimeCommitSha = ciRuntime?.CommitSha;
+                job.AspNetCoreCommitSha = ciAspNetCore?.CommitSha;
             }
 
             // Updating Job to reflect actual versions used
@@ -3697,6 +3291,8 @@ namespace Microsoft.Crank.Agent
             job.RuntimeVersion = runtimeVersion;
             job.DesktopVersion = desktopVersion;
             job.SdkVersion = sdkVersion;
+            if (useBuildCache)
+                job.BuildFramework = targetFramework;
 
             if (!job.Metadata.Any(x => x.Name == Measurements.BenchmarksNetSdkVersion))
             {
@@ -3743,7 +3339,7 @@ namespace Microsoft.Crank.Agent
                     {
                         Name = Measurements.BenchmarksAspNetCoreVersion,
                         Timestamp = DateTime.UtcNow,
-                        Value = $"{aspNetCoreVersion}+{(useBuildCache ? "ci." : "")}{aspnetCoreCommitHash.Substring(0, CommitHashLength)}"
+                        Value = BuildCacheClient.FormatVersion(aspNetCoreVersion, ciAspNetCore?.CommitSha ?? aspnetCoreCommitHash.Substring(0, CommitHashLength))
                     });
 
                     knownDependencies.Add(new Dependency { Names = new[] { "Microsoft.AspNetCore.App" }, CommitHash = aspnetCoreCommitHash, RepositoryUrl = "https://github.com/dotnet/aspnetcore", Version = aspNetCoreVersion });
@@ -3776,7 +3372,7 @@ namespace Microsoft.Crank.Agent
                     {
                         Name = Measurements.BenchmarksNetCoreAppVersion,
                         Timestamp = DateTime.UtcNow,
-                        Value = $"{runtimeVersion}+{(useBuildCache ? "ci." : "")}{netCoreAppCommitHash.Substring(0, CommitHashLength)}"
+                        Value = BuildCacheClient.FormatVersion(runtimeVersion, ciRuntime?.CommitSha ?? netCoreAppCommitHash.Substring(0, CommitHashLength))
                     });
 
                     knownDependencies.Add(new Dependency { Names = new[] { "Microsoft.NETCore.App" }, CommitHash = netCoreAppCommitHash, RepositoryUrl = "https://github.com/dotnet/runtime", Version = runtimeVersion });
@@ -3790,9 +3386,19 @@ namespace Microsoft.Crank.Agent
             // Build and Restore
             var dotnetExecutable = GetDotNetExecutable(dotnetDir);
 
+            string ciPackages = null;
+            if (useBuildCache && job.SelfContained)
+            {
+                ciPackages = await BuildCacheClient.PrepareRuntimePacksAsync(_httpClient, dotnetExecutable,
+                    runtimeHomeDir, sdkVersion, targetFramework, GetPlatformMoniker(), ciRuntime, ciAspNetCore, cancellationToken);
+                env["NUGET_PACKAGES"] = ciPackages;
+                buildRuntimeVersion = runtimeVersion;
+                buildAspNetCoreVersion = aspNetCoreVersion;
+            }
+
             var buildParameters =
-                $"/p:MicrosoftNETCoreAppPackageVersion={runtimeVersion} " +
-                $"/p:MicrosoftAspNetCoreAppPackageVersion={aspNetCoreVersion} " +
+                $"/p:MicrosoftNETCoreAppPackageVersion={buildRuntimeVersion} " +
+                $"/p:MicrosoftAspNetCoreAppPackageVersion={buildAspNetCoreVersion} " +
                 $"/p:GenerateErrorForMissingTargetingPacks=false " +
                 $"/p:RestoreNoCache=true " // https://github.com/aspnet/Benchmarks/issues/1445 force no cache for restore to avoid restore failures for packages published within last 30 minutes
                 ;
@@ -3811,6 +3417,11 @@ namespace Microsoft.Crank.Agent
             foreach (var argument in job.BuildArguments)
             {
                 buildParameters += $"{argument} ";
+            }
+
+            if (ciPackages != null)
+            {
+                buildParameters += $"/p:RestorePackagesPath=\"{ciPackages}\" ";
             }
 
             // Specify tfm in case the project targets multiple one
@@ -3920,79 +3531,7 @@ namespace Microsoft.Crank.Agent
 
                 Log.Info($"Application published successfully in {job.BuildTime.TotalMilliseconds} ms");
 
-                // Build Cache: overlay BCS binaries onto the just-published app for BOTH frameworks.
-                // The per-job dotnet home was built earlier (used for FDD execution + metadata); here
-                // we cover the SCD case where the frameworks ship in the publish output. PatchRuntimeConfig
-                // still runs with the feed-resolved versions so runtimeconfig.json points to real installed
-                // shared-framework dirs.
-                if (useBuildCache && (runtimeBuildCacheExtractDir != null || aspNetCoreBuildCacheExtractDir != null))
-                {
-                    var runtimeShortSha = BuildCacheClient.ShortSha(runtimeBuildCacheCommitSha);
-                    var aspNetShortSha = BuildCacheClient.ShortSha(aspNetCoreBuildCacheCommitSha);
-
-                    int publishedOverlay = 0;
-                    try
-                    {
-                        var publishProjectFileName = Path.Combine(benchmarkedApp, FormatPathSeparators(job.Project));
-                        var assemblyName = GetAssemblyName(job, publishProjectFileName);
-
-                        if (runtimeBuildCacheExtractDir != null)
-                        {
-                            publishedOverlay += BuildCacheClient.OverlayPublishedOutput(
-                                runtimeBuildCacheExtractDir,
-                                outputFolder,
-                                runtimeBuildCacheConfigResolved,
-                                assemblyName,
-                                BuildCacheClient.BuildCacheFlavor.Runtime);
-                        }
-
-                        if (aspNetCoreBuildCacheExtractDir != null)
-                        {
-                            publishedOverlay += BuildCacheClient.OverlayPublishedOutput(
-                                aspNetCoreBuildCacheExtractDir,
-                                outputFolder,
-                                aspNetCoreBuildCacheConfigResolved,
-                                assemblyName,
-                                BuildCacheClient.BuildCacheFlavor.AspNetCore);
-                        }
-
-                        Log.Info($"Build Cache: Overlaid {publishedOverlay} files into published output (runtime {runtimeShortSha}, aspnetcore {aspNetShortSha})");
-                    }
-                    catch (Exception ex)
-                    {
-                        job.Error = $"Build Cache: published-output overlay failed: {ex.Message}";
-                        return null;
-                    }
-
-                    // For self-contained publishes the published output must contain the framework binaries.
-                    // For framework-dependent publishes 0 is acceptable here because the per-job dotnet home
-                    // already provides BCS bits at runtime.
-                    if (job.SelfContained && publishedOverlay == 0)
-                    {
-                        job.Error = $"Build Cache: published-output overlay copied 0 files for self-contained " +
-                                    $"job (runtime {runtimeShortSha}, aspnetcore {aspNetShortSha}). The archive layout may have changed or the platform is not supported.";
-                        return null;
-                    }
-                }
-
-                // Stamp the BCS commit onto each overridden framework's reported version. This runs on the
-                // buildcache resolution regardless of whether the archive was downloaded this run (a persistent
-                // home cache-hit skips the download but the versions must still carry the resolved sha so
-                // bisection runs stay distinguishable). Appended, not replaced, so PatchRuntimeConfig below
-                // still uses the clean feed-resolved local versions.
-                if (useBuildCache)
-                {
-                        if (!string.IsNullOrEmpty(runtimeBuildCacheCommitSha))
-                        {
-                            job.RuntimeVersion = $"{runtimeVersion}+ci.{BuildCacheClient.ShortSha(runtimeBuildCacheCommitSha)}";
-                        }
-                        if (!string.IsNullOrEmpty(aspNetCoreBuildCacheCommitSha))
-                        {
-                            job.AspNetCoreVersion = $"{aspNetCoreVersion}+ci.{BuildCacheClient.ShortSha(aspNetCoreBuildCacheCommitSha)}";
-                        }
-                }
-
-                PatchRuntimeConfig(job, outputFolder, aspNetCoreVersion, runtimeVersion);
+                PatchRuntimeConfig(job, outputFolder, aspNetCoreVersion, runtimeVersion, useBuildCache);
             }
 
             var publishedSize = DirSize(new DirectoryInfo(outputFolder)) / 1024;
@@ -4218,16 +3757,33 @@ namespace Microsoft.Crank.Agent
             }
         }
 
+        private static async Task InstallFrameworkAsync(string version, string runtime, string home, string feed,
+            IDictionary<string, string> environment, CancellationToken cancellationToken)
+        {
+            var windows = OperatingSystem == OperatingSystem.Windows;
+            var arguments = GetFrameworkInstallArguments(windows, version, runtime, home, feed, GetPlatformMoniker().Split('-').Last());
+            await ProcessUtil.RunAsync(windows ? _pwsh : "/usr/bin/env", arguments,
+                workingDirectory: _dotnetInstallPath, environmentVariables: environment,
+                throwOnError: true, cancellationToken: cancellationToken);
+        }
+
+        internal static string GetFrameworkInstallArguments(bool windows, string version, string runtime, string home, string feed, string architecture)
+        {
+            return windows
+                ? $"-NoProfile -ExecutionPolicy Bypass -File dotnet-install.ps1 -Version \"{version}\" -Runtime {runtime} -Architecture {architecture} -NoPath -SkipNonVersionedFiles -InstallDir \"{home}\" -AzureFeed \"{feed}\""
+                : $"bash dotnet-install.sh --version \"{version}\" --runtime {runtime} --architecture {architecture} --no-path --skip-non-versioned-files --install-dir \"{home}\" --azure-feed \"{feed}\"";
+        }
+
         /// <summary>
         /// Returns the platform moniker used by .NET (win-x64, linux-x64, osx-x64, linux-arm64, osx-arm64, win-arm64).
         /// </summary>
         private static string GetPlatformMoniker()
         {
-            // Delegate to the single shared RID resolver so the publish RID and the BCS archive/config
-            // selection (BuildCacheClient.ResolveBuildCacheConfig) can never diverge. BuildCacheClient's
-            // resolver is behavior-identical to the historical body here (win non-arm64 -> win-x64,
-            // including x86; osx/linux arm64 vs x64).
-            return BuildCacheClient.GetPlatformMoniker();
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                return RuntimeInformation.ProcessArchitecture == Architecture.Arm64 ? "win-arm64" : "win-x64";
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+                return RuntimeInformation.ProcessArchitecture == Architecture.Arm64 ? "osx-arm64" : "osx-x64";
+            return RuntimeInformation.ProcessArchitecture == Architecture.Arm64 ? "linux-arm64" : "linux-x64";
         }
 
         private static string GetAssemblyName(Job job, string projectFileName)
@@ -4292,7 +3848,7 @@ namespace Microsoft.Crank.Agent
 
         private static bool IsVersionPrefix(string version)
         {
-            return !String.IsNullOrEmpty(version) && char.IsDigit(version[0]);
+            return !String.IsNullOrEmpty(version) && !BuildCacheClient.IsCommitSha(version) && char.IsDigit(version[0]);
         }
 
         /// <summary>
@@ -4486,14 +4042,6 @@ namespace Microsoft.Crank.Agent
 
             switch (aspNetCoreVersion.ToLowerInvariant())
             {
-                case "ci":
-                    // Defensive: on the ci channel aspNetCoreVersion is forced to "latest" before this point
-                    // (the BCS pack is placed into the feed-resolved folder), so this normally isn't hit.
-                    // Treat the raw sentinel as Latest so the shared-framework version still resolves to a
-                    // real feed version (the folder the BCS bits are placed into).
-                    aspNetCoreVersion = await ResolveAspNetCoreVersion("Latest", targetFramework);
-                    Log.Info($"ASP.NET: {aspNetCoreVersion} (ci → Latest)");
-                    break;
                 case "current":
                     aspNetCoreVersion = string.IsNullOrEmpty(currentAspNetCoreVersion)
                         ? await ResolveAspNetCoreVersion("Latest", targetFramework)
@@ -4929,13 +4477,15 @@ namespace Microsoft.Crank.Agent
             }
         }
 
-        private static void PatchRuntimeConfig(Job job, string publishFolder, string aspnetcoreversion, string runtimeversion)
+        internal static void PatchRuntimeConfig(Job job, string publishFolder, string aspnetcoreversion, string runtimeversion, bool ci = false)
         {
             var folder = new DirectoryInfo(publishFolder);
             var runtimeConfigFilename = folder.GetFiles("*.runtimeconfig.json").FirstOrDefault()?.FullName;
 
             if (!File.Exists(runtimeConfigFilename))
             {
+                if (ci)
+                    throw new InvalidOperationException("CI execution requires a framework-dependent runtimeconfig.json.");
                 Log.Info("Ignoring runtimeconfig.json. File not found.");
                 return;
             }
@@ -4949,7 +4499,32 @@ namespace Microsoft.Crank.Agent
 
             if (runtimeOptions.ContainsKey("includedFrameworks"))
             {
+                if (ci && !job.SelfContained)
+                    throw new InvalidOperationException("CI installer execution cannot use self-contained publish output. Remove self-contained build arguments.");
                 Log.Info("Application is self-contained, skipping runtimeconfig.json");
+                return;
+            }
+
+            if (ci)
+            {
+                if (job.SelfContained)
+                    throw new InvalidOperationException("The CI self-contained job did not publish self-contained output.");
+                var references = runtimeOptions["frameworks"] as JArray ??
+                    (runtimeOptions["framework"] is JObject framework ? new JArray(framework.DeepClone()) : new JArray());
+                if (references.Count == 0)
+                    throw new InvalidOperationException("CI runtimeconfig.json has no shared-framework references.");
+                foreach (var reference in references)
+                {
+                    switch ((string)reference["name"])
+                    {
+                        case "Microsoft.NETCore.App": reference["version"] = runtimeversion; break;
+                        case "Microsoft.AspNetCore.App": reference["version"] = aspnetcoreversion; break;
+                    }
+                }
+                runtimeOptions.Remove("framework");
+                runtimeOptions["frameworks"] = references;
+                runtimeOptions["rollForward"] = "Disable";
+                File.WriteAllText(runtimeConfigFilename, runtimeObject.ToString());
                 return;
             }
 
@@ -5117,13 +4692,6 @@ namespace Microsoft.Crank.Agent
                         Log.Info($"Runtime: {runtimeVersion} (Edge - Fallback on Current)");
                         break;
                 }
-            }
-            else if (String.Equals(runtimeVersion, "BuildCache", StringComparison.OrdinalIgnoreCase))
-            {
-                // BuildCache channel: version resolution is deferred to InstallRuntimeFromBuildCacheAsync
-                // because it needs to download artifacts. We return a placeholder here.
-                runtimeVersion = "BuildCache";
-                Log.Info($"Runtime: will be resolved from Build Cache Service");
             }
             else
             {
@@ -5360,7 +4928,39 @@ namespace Microsoft.Crank.Agent
                 : Path.Combine(dotnetHome, "dotnet");
         }
 
-        private static async Task<Process> StartProcess(string hostname, string benchmarksRepo, Job job, string dotnetHome, JobContext context)
+        internal static bool CanStartJob(Job job, CancellationToken cancellationToken) =>
+            !cancellationToken.IsCancellationRequested && job.State == JobState.Starting;
+
+        internal static bool CanDeleteBuildCacheHome(JobContext context, Job job, bool stopped)
+        {
+            if (!stopped || context.BuildAndRunTask is { IsCompletedSuccessfully: false })
+                return false;
+
+            try
+            {
+                if (context.Process != null && !context.Process.HasExited)
+                    return false;
+                foreach (var id in job.AllProcessIds.Where(id => id > 0).Distinct())
+                {
+                    try
+                    {
+                        using var owner = Process.GetProcessById(id);
+                        if (!owner.HasExited)
+                            return false;
+                    }
+                    catch (ArgumentException)
+                    {
+                        // The recorded PID no longer exists.
+                    }
+                }
+                return true;
+            }
+            catch (InvalidOperationException) { return false; }
+            catch (System.ComponentModel.Win32Exception) { return false; }
+            catch (NotSupportedException) { return false; }
+        }
+
+        private static async Task<Process> StartProcess(string hostname, string benchmarksRepo, Job job, string dotnetHome, JobContext context, CancellationToken cancellationToken)
         {
             var workingDirectory = !String.IsNullOrEmpty(job.Project)
                 ? Path.Combine(benchmarksRepo, Path.GetDirectoryName(FormatPathSeparators(job.Project)))
@@ -5579,8 +5179,12 @@ namespace Microsoft.Crank.Agent
                 process.StartInfo.EnvironmentVariables.Add("DOTNET_PROCESSOR_COUNT", cpuList.Count.ToString(CultureInfo.InvariantCulture));
             }
 
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!CanStartJob(job, cancellationToken))
+                throw new OperationCanceledException("The job is no longer starting.");
             stopwatch.Start();
             process.Start();
+            job.ProcessId = process.Id;
 
             var useWindowsLimiter = OperatingSystem == OperatingSystem.Windows && (job.MemoryLimitInBytes > 0 || job.CpuLimitRatio > 0 || !String.IsNullOrWhiteSpace(job.CpuSet));
 
@@ -5599,8 +5203,6 @@ namespace Microsoft.Crank.Agent
                     limiter.Dispose();
                 };
             }
-
-            job.ProcessId = process.Id;
 
             process.BeginOutputReadLine();
             process.BeginErrorReadLine();

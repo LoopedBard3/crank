@@ -59,7 +59,7 @@ When a TFM is configured, the agent will download the corresponding .NET SDK ver
 
 The difference between `latest` and `edge` is that `latest` will pick runtimes and SDKs that are deemed compatible together. For instance a very recent .NET core runtime might be compatible with a less recent ASP.NET runtime. The `edge` is used to pick the absolute latest build for the select TFM.
 
-The `ci` channel uses the Build Cache Service (BCS) from `dotnet-performance-infra` to resolve framework versions by individual commit SHA rather than from VMR feeds. This provides much finer-grained control — every cached commit is available, whereas VMR feeds may have multi-day gaps between ingested commits. On this channel crank overrides **both** the base .NET runtime (`Microsoft.NETCore.App`, from dotnet/runtime) **and** the ASP.NET Core shared framework (`Microsoft.AspNetCore.App`, from dotnet/aspnetcore); each defaults to the latest cached build and can be pinned independently by passing a commit SHA in `runtimeVersion` / `aspNetCoreVersion`. SDK and desktop versions are resolved from `latest`.
+The `ci` channel uses the Build Cache Service (BCS) to resolve complete framework installers by individual commit SHA rather than VMR feed version. Empty `runtimeVersion` and `aspNetCoreVersion` selectors inherit this channel; either component can independently use a full commit SHA, `ci`, or a normal feed selector. SDK and desktop versions default to `latest` on this channel and can be set separately.
 
 In order to benchmark and ASP.NET application using very recent runtimes of .NET 5, the `latest` channel is recommended:
 
@@ -124,51 +124,89 @@ The following command uses the `edge` channel but ASP.NET is fixed so it doesn't
 
 The `ci` channel resolves pre-built binaries for individual commits from the Build Cache Service (BCS). This is useful for performance regression bisection where VMR feed gaps make it hard to pinpoint which commit caused a regression.
 
-On this channel crank always overrides **both** frameworks, each resolved from its own repository:
+Each framework resolves independently from its own repository:
 
-- **Base runtime** (`Microsoft.NETCore.App`) is **overlaid** with BCS bits built from a [dotnet/runtime](https://github.com/dotnet/runtime) commit. The runtime archive is raw build output (no shared-framework metadata), so BCS binaries are overlaid onto a feed-installed runtime.
-- **ASP.NET Core shared framework** (`Microsoft.AspNetCore.App`) is **placed directly** from a [dotnet/aspnetcore](https://github.com/dotnet/aspnetcore) commit's BCS build. The aspnetcore archive is the runtime-pack nupkg stored verbatim (carrying `deps.json` + `runtimeconfig.json`), so the framework folder is built entirely from BCS and the job **fails** if the pack is incomplete.
+- **Base runtime** (`Microsoft.NETCore.App`) uses a [dotnet/runtime](https://github.com/dotnet/runtime) commit's complete installer archive, including its matching host and original metadata.
+- **ASP.NET Core** (`Microsoft.AspNetCore.App`) uses a [dotnet/aspnetcore](https://github.com/dotnet/aspnetcore) commit's complete installer archive. Its bundled base runtime is isolated and discarded; only the complete ASP.NET shared-framework directory is promoted.
 
-Each repository resolves **independently**: by default both use the latest cached build on `main`. On the `ci` channel the existing `runtimeVersion` and `aspNetCoreVersion` arguments carry a **commit SHA** rather than a feed version — supply a SHA to pin/bisect one repo while the other stays latest, or leave it empty to use the latest cached build. The *latest* lookup always targets `main` (the pipeline only builds `main`).
+For either `runtimeVersion` or `aspNetCoreVersion`:
 
-> **Note:** On the `ci` channel, `runtimeVersion` / `aspNetCoreVersion` accept **only** a commit SHA (8–40 hex characters) or an empty value (= latest cached build). A feed version string is **rejected with an error** — version-string pinning is not supported on this channel. Conversely, on the other channels (`current` / `latest` / `edge`) those same arguments accept a version string and do **not** accept a commit SHA. The reported `runtimeVersion` / `aspNetCoreVersion` for a `ci` run are stamped with the resolved commit as `{feedVersion}+ci.{shortSha}`.
+| Selector | Meaning |
+|----------|---------|
+| Empty | Inherit the job channel |
+| `ci` | Latest cached installer build on `main` |
+| Full 40-hex SHA | Exact BCS commit, normalized to lowercase |
+| `current`, `latest`, `edge`, or concrete version | Normal feeds, even when the job channel is `ci` |
 
-### Basic usage (latest cached build of both frameworks on main)
+Short SHAs are not accepted. A commit without ready installer artifacts fails rather
+than falling back to feed or raw-overlay binaries.
+
+### Compilation and execution are separate
+
+Framework-dependent jobs build using the selected SDK and its reference packs.
+For a BCS component, compile-time framework-version properties resolve from the
+ordinary job channel (`latest` when the channel is `ci`), never from the execution
+commit's product version. `framework` or the project TFM remains the compilation
+target: even a numeric-leading SHA cannot select or retarget it.
+
+The SDK installs through the existing global flow. Complete execution frameworks
+install through stock `dotnet-install` into a fresh, private job home. The published
+runtimeconfig selects their actual versions with roll-forward disabled. Framework
+dependency metadata and version directories are never synthesized or renamed.
+
+For controlled comparisons, choose an explicit `sdkVersion` and TFM; this is
+recommended, not mandatory. Configure the application's ordinary NuGet sources for
+its dependencies and any feed-selected framework packs. CI jobs preserve the
+application's NuGet hierarchy and package-source mapping.
+
+### Examples
+
+Both frameworks from the latest ready BCS builds:
 
 ```
-> crank --config benchmarks.yml --scenario json --profile aspnet-perf-lin --application.channel ci
+crank --config benchmarks.yml --scenario json --profile aspnet-perf-lin --application.channel ci
 ```
 
-### Bisecting ASP.NET Core (pin aspnetcore, runtime stays latest)
+Pin runtime while explicitly retaining ASP.NET from feeds:
 
 ```
-> crank --config benchmarks.yml --scenario json --profile aspnet-perf-lin --application.channel ci --application.aspNetCoreVersion a1b2c3d4e5f6...
+crank --config benchmarks.yml --scenario json --profile aspnet-perf-lin --application.channel ci --application.runtimeVersion 1111aaaa2222bbbb3333cccc4444dddd5555eeee --application.aspNetCoreVersion latest
 ```
 
-### Bisecting the base runtime (pin runtime, aspnetcore stays latest)
+Select only ASP.NET from BCS while keeping runtime/SDK on the normal channel:
 
 ```
-> crank --config benchmarks.yml --scenario json --profile aspnet-perf-lin --application.channel ci --application.runtimeVersion a1b2c3d4e5f6...
+crank --config benchmarks.yml --scenario json --profile aspnet-perf-lin --application.aspNetCoreVersion ci
 ```
 
-### Pinning both
+### Results and current scope
 
-```
-> crank --config benchmarks.yml --scenario json --profile aspnet-perf-lin --application.channel ci \
-    --application.runtimeVersion 1111aaaa2222bbbb... \
-    --application.aspNetCoreVersion 3333cccc4444dddd...
-```
+`runtimeVersion` and `aspNetCoreVersion` report plain, actual installed versions.
+`runtimeCommitSha` / `aspNetCoreCommitSha` retain full resolved BCS commits;
+`requestedRuntimeVersion` / `requestedAspNetCoreVersion` retain the selectors.
+Version measurements use `{actualVersion}+{fullSHA}` for BCS components, preserving
+the existing version/commit result schema. CI provenance stays in the separate fields.
+`sdkVersion` and `buildFramework` identify the compilation baseline.
 
-If a requested commit is not found in the cache, crank fails with an error rather than falling back.
+Ordinary self-contained jobs are supported when the selected commits also publish
+their original runtime nupkgs and Crank performs the project publish (without an
+`executable` override). A local-only SDK `PackageDownload` restore populates
+a job-private NuGet cache before normal publishing, isolating same-version packages
+from different commits. The SDK selects runtime versions independently per framework;
+reference packs, compiler, and apphost remain SDK-baseline inputs. There is no
+post-publish overlay. A missing selected BCS pack fails without fallback.
+Active `useMonoRuntime` modes are rejected for CI selections because they would replace
+the selected CoreCLR bits after publishing.
 
-### `ci` channel properties
-
-| Property | Default | Description |
-|----------|---------|-------------|
-| `runtimeVersion` | (empty = latest) | On the `ci` channel: a [dotnet/runtime](https://github.com/dotnet/runtime) commit SHA (8–40 hex chars) to resolve from BCS and overlay onto `Microsoft.NETCore.App`. Empty uses the latest cached runtime build on `main`. A feed version string is rejected with an error. |
-| `aspNetCoreVersion` | (empty = latest) | On the `ci` channel: a [dotnet/aspnetcore](https://github.com/dotnet/aspnetcore) commit SHA (8–40 hex chars) to resolve from BCS and place as `Microsoft.AspNetCore.App`. Empty uses the latest cached aspnetcore build on `main`. A feed version string is rejected with an error. |
-
-The BCS configuration key (e.g., `coreclr_x64_linux` for runtime, `aspnetcore_x64_linux` for aspnetcore) is auto-detected per repo from the agent platform. Platforms with no aspnetcore config (there is no macOS/musl/arm32 in v1) fail loud rather than silently skipping.
+Skipping a previously cached build (`reuseBuild`/`noBuild` on an actual cache hit)
+is explicitly unsupported for CI selections in this initial implementation.
+Source caching and fresh rebuilds with `buildKey` remain supported. This restriction
+avoids mutating or silently running a shared reused app with the wrong runtime.
+No persistent framework-home cache, eviction budget, or latest-resolution scheduler
+is introduced. See [the producer contract](build_cache_requirements.md) for payload
+paths and supported platforms.
+If build completion or process termination cannot be confirmed, cleanup retains the
+private CI home and logs its path rather than deleting files still in use.
 
 ### Agent configuration
 
