@@ -10,6 +10,13 @@ using Newtonsoft.Json;
 
 namespace Microsoft.Crank.Agent
 {
+    /// <summary>
+    /// Completion proof and reporting snapshot for a successful CI (BCS-selected or feed-selected,
+    /// commit-pinned) build. Written only after a whole publish succeeds, and read back as-is on a
+    /// matching request (same requested BuildKey/options, NoBuild) without re-resolving or comparing
+    /// against anything newly resolved: "ci"/"latest" means latest when this build was created. A
+    /// miss (missing/malformed/unsupported record, or missing expected output) always rebuilds normally.
+    /// </summary>
     internal sealed class CiBuildRecord
     {
         internal const string FileName = ".ci-build.json";
@@ -40,23 +47,54 @@ namespace Microsoft.Crank.Agent
             (!selection.SelfContained || File.Exists(Path.Combine(output,
                 selection.AssemblyName + (selection.Rid.StartsWith("win-", StringComparison.Ordinal) ? ".exe" : ""))));
 
-        internal static CiBuildRecord Read(string path, string output, Inputs selection)
+        /// <summary>
+        /// Internal snapshot-shape validation only: never compares against a user-supplied or newly
+        /// resolved selector/commit/version. At least one side must be BCS-selected (a CI record always
+        /// has one); each present <see cref="BuildCacheClient.ResolvedBuild"/> must carry a full commit
+        /// SHA, an HTTP(S) feed, and a version that is both well-formed and matches its own selection
+        /// field; a feed-selected side's selection version must also be well-formed. Without this, a
+        /// malformed/inconsistent record (missing SHA/feed, or a version mismatched with its own
+        /// ResolvedBuild) would otherwise pass Read and only fail much later during reinstall/validation,
+        /// instead of being treated as a normal cache miss up front.
+        /// </summary>
+        private static bool IsConsistentSnapshot(Inputs selection) =>
+            (selection.RuntimeBuild != null || selection.AspNetCoreBuild != null) &&
+            IsConsistentBuild(selection.RuntimeBuild, selection.RuntimeVersion) &&
+            IsConsistentBuild(selection.AspNetCoreBuild, selection.AspNetCoreVersion) &&
+            BuildCacheClient.IsVersion(selection.RuntimeVersion) &&
+            BuildCacheClient.IsVersion(selection.AspNetCoreVersion) &&
+            BuildCacheClient.IsVersion(selection.SdkVersion);
+
+        private static bool IsConsistentBuild(BuildCacheClient.ResolvedBuild build, string selectionVersion) =>
+            build == null ||
+            (BuildCacheClient.IsCommitSha(build.CommitSha) &&
+             Uri.TryCreate(build.AzureFeed, UriKind.Absolute, out var feed) &&
+             (feed.Scheme == Uri.UriSchemeHttp || feed.Scheme == Uri.UriSchemeHttps) &&
+             BuildCacheClient.IsVersion(build.Version) &&
+             build.Version == selectionVersion);
+
+        internal static CiBuildRecord Read(string path, string output, string assemblyName, string rid, bool selfContained)
         {
             try
             {
                 var record = JsonConvert.DeserializeObject<CiBuildRecord>(File.ReadAllText(Path.Combine(path, FileName)));
-                if (record?.SchemaVersion == 1 && record.Selection == selection &&
+                if (record?.SchemaVersion == 1 && record.Selection != null &&
+                    record.Selection.AssemblyName == assemblyName &&
+                    record.Selection.Rid == rid &&
+                    record.Selection.SelfContained == selfContained &&
+                    !string.IsNullOrEmpty(record.Selection.Framework) &&
+                    IsConsistentSnapshot(record.Selection) &&
                     record.Results != null && record.Metadata != null && record.Dependencies != null &&
                     record.Results.All(result => result?.Name != null && result.Value != null) &&
                     record.Metadata.All(metadata => metadata?.Name != null) &&
                     record.Dependencies.All(dependency => dependency != null) &&
                     ResultNames.Take(3).All(name => record.Results.Any(result => result?.Name == name && result.Value != null) &&
                         record.Metadata.Any(metadata => metadata?.Name == name)) &&
-                    OutputsExist(output, selection))
+                    OutputsExist(output, record.Selection))
                 {
                     return record;
                 }
-                Log.Info("CI build cache miss: completion record, resolved inputs, or published output do not match.");
+                Log.Info("CI build cache miss: completion record, basic fields, or published output do not match.");
             }
             catch (Exception ex) when (ex is IOException or JsonException)
             {

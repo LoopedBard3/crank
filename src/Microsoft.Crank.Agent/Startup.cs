@@ -112,8 +112,6 @@ namespace Microsoft.Crank.Agent
         // Build Cache Service configuration
         private static string _buildCacheBaseUrl = "https://pvscmdupload.z22.web.core.windows.net";
         private static bool _buildCacheEnabled = true;
-        private static readonly Dictionary<string, JobContext> _buildOwners = new(
-            RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
 
         // Cached lists of SDKs and runtimes already installed
         private static readonly HashSet<string> _installedAspNetRuntimes = new(StringComparer.OrdinalIgnoreCase);
@@ -763,13 +761,6 @@ namespace Microsoft.Crank.Agent
                                 }
                                 else
                                 {
-                                    // Defer, never wait on a held lock: this loop must keep processing the owner's deletion.
-                                    if (!String.IsNullOrEmpty(job.BuildKey) &&
-                                        !TryAcquireBuildPath(context, Path.Combine(_rootTempDir, job.BuildKey)))
-                                    {
-                                        await Task.Delay(1000);
-                                        continue;
-                                    }
                                     foreach ((var sourceName, var source) in job.Sources)
                                     {
                                         if (!String.IsNullOrEmpty(source.SourceKey))
@@ -1936,8 +1927,6 @@ namespace Microsoft.Crank.Agent
                                 }
                                 finally
                                 {
-                                    if (!ReleaseBuildPath(context, job, stopped))
-                                        Log.Info($"Retaining build ownership for '{context.OwnedBuildPath}': writers or processes may still be active.");
                                     if (_cleanup && !job.NoClean && !tempDirUsesSourceKey && tempDir != null)
                                     {
                                         // Delete traces
@@ -2961,10 +2950,73 @@ namespace Microsoft.Crank.Agent
             // Skip installing dotnet or building project if already built and build is not requested
             requireDotnetBuild = !reuseFolder || !job.NoBuild;
 
-            if (!requireDotnetBuild && !useBuildCache)
+            var projectFileName = Path.Combine(benchmarkedApp, Path.GetFileName(FormatPathSeparators(job.Project)));
+
+            if (!requireDotnetBuild)
             {
-                Log.Info("Skipping build step, reusing previous build");
-                return path;
+                if (!useBuildCache)
+                {
+                    Log.Info("Skipping build step, reusing previous build");
+                    return path;
+                }
+
+                // CI candidate: the requested options/source already matched (reuseFolder) and a rebuild
+                // was not requested (NoBuild). Try to reuse a previously completed build without resolving
+                // or installing anything beyond what the frozen record already recorded. "ci"/"latest" here
+                // means "latest when the cached build was created" — the record is never compared against a
+                // freshly resolved commit, feed version, or SDK.
+                var cachedBuild = !string.IsNullOrEmpty(job.Project) && string.IsNullOrEmpty(job.Executable)
+                    ? CiBuildRecord.Read(path, Path.Combine(benchmarkedApp, "published"), GetAssemblyName(job, projectFileName), GetPlatformMoniker(), job.SelfContained)
+                    : null;
+
+                if (cachedBuild != null)
+                {
+                    try
+                    {
+                        if (!job.SelfContained)
+                        {
+                            cancellationToken.ThrowIfCancellationRequested();
+                            var home = Path.Combine(_rootTempDir, $"ci-dotnet-{Guid.NewGuid():N}");
+                            jobContext.BuildCacheDotnetHome = home;
+                            Directory.CreateDirectory(home);
+                            var aspHome = Path.Combine(home, "aspnetcore-install");
+                            var installEnv = new Dictionary<string, string> { ["DOTNET_ROOT"] = dotnetHome };
+
+                            var runtimeFeed = cachedBuild.Selection.RuntimeBuild?.AzureFeed;
+                            if (runtimeFeed == null && !TryGetAzureFeedForPackage(PackageTypes.NetCoreApp, cachedBuild.Selection.RuntimeVersion, out runtimeFeed))
+                                throw new InvalidOperationException($"Could not locate a feed for runtime '{cachedBuild.Selection.RuntimeVersion}'.");
+                            await InstallFrameworkAsync(cachedBuild.Selection.RuntimeVersion, "dotnet", home, runtimeFeed, installEnv, cancellationToken);
+
+                            var aspNetFeed = cachedBuild.Selection.AspNetCoreBuild?.AzureFeed;
+                            if (aspNetFeed == null && !TryGetAzureFeedForPackage(PackageTypes.AspNetCore, cachedBuild.Selection.AspNetCoreVersion, out aspNetFeed))
+                                throw new InvalidOperationException($"Could not locate a feed for ASP.NET Core '{cachedBuild.Selection.AspNetCoreVersion}'.");
+                            await InstallFrameworkAsync(cachedBuild.Selection.AspNetCoreVersion, "aspnetcore", aspHome, aspNetFeed, installEnv, cancellationToken);
+
+                            if (cachedBuild.Selection.RuntimeBuild != null)
+                                BuildCacheClient.ValidateInstallation(home, "Microsoft.NETCore.App", cachedBuild.Selection.RuntimeBuild);
+                            if (cachedBuild.Selection.AspNetCoreBuild != null)
+                                BuildCacheClient.ValidateInstallation(aspHome, "Microsoft.AspNetCore.App", cachedBuild.Selection.AspNetCoreBuild);
+
+                            BuildCacheClient.PromoteAspNetCoreFramework(home, aspHome);
+                            await TryDeleteDirAsync(aspHome);
+                        }
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        job.Error = $"Could not reinstall recorded CI frameworks for cached build: {ex.Message}";
+                        return null;
+                    }
+
+                    cancellationToken.ThrowIfCancellationRequested();
+                    cachedBuild.Restore(job);
+                    Log.Info(job.SelfContained
+                        ? "Reusing completed CI self-contained publish; skipping installers and build."
+                        : "Reusing completed CI framework-dependent publish with a fresh private runtime home; skipping build.");
+                    return path;
+                }
+
+                // Record missing/malformed/unsupported, or expected output is incomplete: rebuild normally.
+                CiBuildRecord.Invalidate(path);
             }
 
             var env = new Dictionary<string, string>
@@ -2998,8 +3050,6 @@ namespace Microsoft.Crank.Agent
 
             ConvertLegacyVersions(ref targetFramework, ref runtimeVersion, ref aspNetCoreVersion);
 
-            var projectFileName = Path.Combine(benchmarkedApp, Path.GetFileName(FormatPathSeparators(job.Project)));
-
             // If a specific framework is set, use it instead of the detected one
             if (!String.IsNullOrEmpty(job.Framework))
             {
@@ -3013,8 +3063,7 @@ namespace Microsoft.Crank.Agent
                 targetFramework = ResolveProjectTFM(job, projectFileName, targetFramework);
             }
 
-            if (!useBuildCache)
-                await PatchProjectFrameworkReferenceAsync(job, projectFileName, targetFramework);
+            await PatchProjectFrameworkReferenceAsync(job, projectFileName, targetFramework);
 
             // If a specific channel is set, use it instead of the detected one
             if (!String.IsNullOrEmpty(job.Channel))
@@ -3063,31 +3112,8 @@ namespace Microsoft.Crank.Agent
                 }
             }
 
-            CiBuildRecord.Inputs selection = null;
-            CiBuildRecord cachedBuild = null;
             if (useBuildCache)
             {
-                sdkVersion = PatchOrCreateGlobalJson(job, benchmarkedApp, sdkVersion, write: false);
-                if (OperatingSystem == OperatingSystem.Windows)
-                    desktopVersion = await ResolveDesktopVersion(desktopVersion, targetFramework);
-                selection = new(ciRuntime, ciAspNetCore, runtimeVersion, aspNetCoreVersion, sdkVersion,
-                    targetFramework, GetPlatformMoniker(), job.SelfContained, buildRuntimeVersion,
-                    buildAspNetCoreVersion, desktopVersion, GetAssemblyName(job, projectFileName));
-                if (reuseFolder && job.NoBuild && !string.IsNullOrEmpty(job.Project) && string.IsNullOrEmpty(job.Executable))
-                    cachedBuild = CiBuildRecord.Read(path, Path.Combine(benchmarkedApp, "published"), selection);
-                if (cachedBuild != null && job.SelfContained)
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    cachedBuild.Restore(job);
-                    Log.Info("Reusing completed CI self-contained publish; skipping installers and build.");
-                    return path;
-                }
-                if (cachedBuild == null)
-                {
-                    CiBuildRecord.Invalidate(path);
-                    await PatchProjectFrameworkReferenceAsync(job, projectFileName, targetFramework);
-                }
-
                 runtimeHomeDir = Path.Combine(_rootTempDir, $"ci-dotnet-{Guid.NewGuid():N}");
                 jobContext.BuildCacheDotnetHome = runtimeHomeDir;
                 Directory.CreateDirectory(runtimeHomeDir);
@@ -3096,8 +3122,7 @@ namespace Microsoft.Crank.Agent
                 aspNetCoreHomeDir = Path.Combine(runtimeHomeDir, "aspnetcore-install");
             }
 
-            if (cachedBuild == null)
-                sdkVersion = PatchOrCreateGlobalJson(job, benchmarkedApp, sdkVersion);
+            sdkVersion = PatchOrCreateGlobalJson(job, benchmarkedApp, sdkVersion);
 
             // Patch NuGet.config to ensure crank sources are included in packageSourceMapping
             if (!useBuildCache)
@@ -3110,10 +3135,9 @@ namespace Microsoft.Crank.Agent
             {
                 if (OperatingSystem == OperatingSystem.Windows)
                 {
-                    if (!useBuildCache)
-                        desktopVersion = await ResolveDesktopVersion(desktopVersion, targetFramework);
+                    desktopVersion = await ResolveDesktopVersion(desktopVersion, targetFramework);
 
-                    if (cachedBuild == null && !_installedSdks.Contains(sdkVersion))
+                    if (!_installedSdks.Contains(sdkVersion))
                     {
                         dotnetInstallStep = $"SDK '{sdkVersion}'";
                         Log.Info($"Installing {dotnetInstallStep} ...");
@@ -3165,7 +3189,7 @@ namespace Microsoft.Crank.Agent
 
                     try
                     {
-                        if (cachedBuild == null && !String.IsNullOrEmpty(desktopVersion)
+                        if (!String.IsNullOrEmpty(desktopVersion)
                             && !_installedDesktopRuntimes.Contains(desktopVersion)
                             && !_ignoredDesktopRuntimes.Contains(desktopVersion))
                         {
@@ -3194,8 +3218,7 @@ namespace Microsoft.Crank.Agent
 
                             _installedDesktopRuntimes.Add(desktopVersion);
                         }
-                        else if (cachedBuild == null && (!useBuildCache || String.IsNullOrEmpty(desktopVersion) ||
-                            !Directory.Exists(Path.Combine(dotnetHome, "shared", "Microsoft.WindowsDesktop.App", desktopVersion))))
+                        else
                         {
                             desktopVersion = SeekCompatibleDesktopRuntime(dotnetHome, targetFramework, desktopVersion);
                         }
@@ -3233,7 +3256,7 @@ namespace Microsoft.Crank.Agent
                 }
                 else
                 {
-                    if (cachedBuild == null && !_installedSdks.Contains(sdkVersion))
+                    if (!_installedSdks.Contains(sdkVersion))
                     {
                         dotnetInstallStep = $"SDK '{sdkVersion}'";
                         Log.Info($"Installing {dotnetInstallStep} ...");
@@ -3330,15 +3353,6 @@ namespace Microsoft.Crank.Agent
             }
 
             // Updating Job to reflect actual versions used
-            if (cachedBuild != null)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                cachedBuild.Restore(job);
-                Log.Info("Reusing completed CI framework-dependent publish with a fresh runtime home; skipping build.");
-                return path;
-            }
-            if (selection != null)
-                selection = selection with { SdkVersion = sdkVersion, DesktopVersion = desktopVersion };
             job.AspNetCoreVersion = aspNetCoreVersion;
             job.RuntimeVersion = runtimeVersion;
             job.DesktopVersion = desktopVersion;
@@ -3780,6 +3794,9 @@ namespace Microsoft.Crank.Agent
                 if (job.State is JobState.Failed or JobState.Deleting or JobState.Deleted or JobState.Stopping or JobState.Stopped)
                     return null;
                 File.WriteAllText(Path.Combine(_rootTempDir, "_options", $"{job.BuildKey}.json"), requestedOptions);
+                var selection = new CiBuildRecord.Inputs(ciRuntime, ciAspNetCore, runtimeVersion, aspNetCoreVersion, sdkVersion,
+                    targetFramework, GetPlatformMoniker(), job.SelfContained, buildRuntimeVersion, buildAspNetCoreVersion,
+                    desktopVersion, GetAssemblyName(job, projectFileName));
                 CiBuildRecord.Write(path, outputFolder, selection, job);
             }
 
@@ -4169,7 +4186,7 @@ namespace Microsoft.Crank.Agent
             return aspNetCoreVersion;
         }
 
-        private static string PatchOrCreateGlobalJson(Job job, string benchmarkedApp, string sdkVersion, bool write = true)
+        private static string PatchOrCreateGlobalJson(Job job, string benchmarkedApp, string sdkVersion)
         {
             // Looking for the first existing global.json file to update
 
@@ -4196,8 +4213,6 @@ namespace Microsoft.Crank.Agent
 
                     var globalObject = JObject.Parse(File.ReadAllText(globalJsonFilename));
                     sdkVersion = globalObject["sdk"]["version"].ToString();
-                    if (!write)
-                        return sdkVersion;
 
                     // Patch global.json such that the version for SDK is preserved even though a new one is locally available
                     globalObject["sdk"]["allowPrerelease"] = true;
@@ -4210,8 +4225,6 @@ namespace Microsoft.Crank.Agent
             }
             else
             {
-                if (!write)
-                    return sdkVersion;
                 if (!File.Exists(globalJsonFilename))
                 {
                     // No global.json found
@@ -4996,33 +5009,6 @@ namespace Microsoft.Crank.Agent
 
         internal static bool CanStartJob(Job job, CancellationToken cancellationToken) =>
             !cancellationToken.IsCancellationRequested && job.State == JobState.Starting;
-
-        internal static bool TryAcquireBuildPath(JobContext context, string path)
-        {
-            path = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
-            lock (_buildOwners)
-            {
-                if (_buildOwners.TryGetValue(path, out var owner))
-                    return owner == context;
-                _buildOwners.Add(path, context);
-                context.OwnedBuildPath = path;
-                return true;
-            }
-        }
-
-        internal static bool ReleaseBuildPath(JobContext context, Job job, bool stopped)
-        {
-            if (context.OwnedBuildPath == null)
-                return true;
-            if (!CanDeleteBuildCacheHome(context, job, stopped) || (job.IsDocker() && job.State != JobState.Stopped))
-                return false;
-            lock (_buildOwners)
-            {
-                _buildOwners.Remove(context.OwnedBuildPath);
-                context.OwnedBuildPath = null;
-                return true;
-            }
-        }
 
         internal static bool CanDeleteBuildCacheHome(JobContext context, Job job, bool stopped)
         {

@@ -3,25 +3,25 @@
 // See the LICENSE file in the project root for more information.
 
 using System;
-using System.Diagnostics;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net;
-using System.Net.Http;
 using System.Net.Sockets;
 using System.Reflection;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Crank.Agent;
 using Microsoft.Crank.Models;
-using Microsoft.Extensions.Caching.Memory;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Xunit;
 
 namespace Microsoft.Crank.UnitTests
 {
+    // A matching cache hit is a frozen completion proof: it is restored as-is (never compared against
+    // anything newly resolved) and never mutates the published project/build output. These tests exercise
+    // both the small CiBuildRecord helper and the real CloneRestoreAndBuild hit/miss routing.
     [Collection("Agent startup")]
     public class CiBuildRecordTests : IDisposable
     {
@@ -29,38 +29,41 @@ namespace Microsoft.Crank.UnitTests
         private const string Sha = "1234567890abcdef1234567890abcdef12345678";
         private string Output => Path.Combine(_root, "published");
 
-        private static CiBuildRecord.Inputs Inputs(bool selfContained = false) => new(
-            new(Sha, "12.0.0-dev", $"https://example.test/runtime/{Sha}/install"),
-            new(Sha, "12.0.0-dev", $"https://example.test/aspnetcore/{Sha}/install"),
+        private static CiBuildRecord.Inputs Inputs(bool selfContained = false, string sha = Sha) => new(
+            new(sha, "12.0.0-dev", $"https://example.test/runtime/{sha}/install"),
+            new(sha, "12.0.0-dev", $"https://example.test/aspnetcore/{sha}/install"),
             "12.0.0-dev", "12.0.0-dev", "10.0.401", "net10.0", "win-x64", selfContained,
             "10.0.12", "10.0.12", "10.0.12", "App");
 
-        private static Job BuiltJob()
+        private static Job BuiltJob(string sha = Sha)
         {
             var job = new Job { DesktopVersion = "10.0.12", PublishedSize = 1234, BuildTime = TimeSpan.FromSeconds(12) };
             foreach (var (name, value) in new[]
             {
                 (Measurements.BenchmarksNetSdkVersion, "10.0.401"),
-                (Measurements.BenchmarksNetCoreAppVersion, $"12.0.0-dev+{Sha}"),
-                (Measurements.BenchmarksAspNetCoreVersion, $"12.0.0-dev+{Sha}")
+                (Measurements.BenchmarksNetCoreAppVersion, $"12.0.0-dev+{sha}"),
+                (Measurements.BenchmarksAspNetCoreVersion, $"12.0.0-dev+{sha}")
             })
             {
                 job.Metadata.Enqueue(new MeasurementMetadata { Name = name, Source = "Host Process", Aggregate = Operation.First });
                 job.Measurements.Enqueue(new Measurement { Name = name, Value = value, Timestamp = DateTime.UtcNow.AddDays(-1) });
             }
             job.Measurements.Enqueue(new Measurement { Name = Measurements.BenchmarksBuildTime, Value = 12000 });
-            job.Dependencies.Add(new Dependency { Id = "test", Names = ["Microsoft.NETCore.App"], CommitHash = Sha, Version = "12.0.0-dev", RepositoryUrl = "https://github.com/dotnet/runtime" });
+            job.Dependencies.Add(new Dependency { Id = "test", Names = ["Microsoft.NETCore.App"], CommitHash = sha, Version = "12.0.0-dev", RepositoryUrl = "https://github.com/dotnet/runtime" });
             return job;
         }
 
-        private void CreateOutput(bool scd = false)
+        private void CreateOutput(bool scd = false, string assemblyName = "App")
         {
             Directory.CreateDirectory(Output);
-            foreach (var file in new[] { "App.dll", "App.deps.json", "App.runtimeconfig.json" })
+            foreach (var file in new[] { $"{assemblyName}.dll", $"{assemblyName}.deps.json", $"{assemblyName}.runtimeconfig.json" })
                 File.WriteAllText(Path.Combine(Output, file), "published fixture");
             if (scd)
-                File.WriteAllText(Path.Combine(Output, "App.exe"), "apphost fixture");
+                File.WriteAllText(Path.Combine(Output, $"{assemblyName}.exe"), "apphost fixture");
         }
+
+        private static CiBuildRecord Read(string root, string output, CiBuildRecord.Inputs current) =>
+            CiBuildRecord.Read(root, output, current.AssemblyName, current.Rid, current.SelfContained);
 
         [Theory]
         [InlineData(false)]
@@ -69,7 +72,7 @@ namespace Microsoft.Crank.UnitTests
         {
             CreateOutput(scd);
             CiBuildRecord.Write(_root, Output, Inputs(scd), BuiltJob());
-            var record = CiBuildRecord.Read(_root, Output, Inputs(scd));
+            var record = Read(_root, Output, Inputs(scd));
             Assert.NotNull(record);
             var job = new Job { NoClean = true, RequestedRuntimeVersion = "ci", RequestedAspNetCoreVersion = Sha };
             record.Restore(job);
@@ -91,6 +94,78 @@ namespace Microsoft.Crank.UnitTests
         }
 
         [Theory]
+        [InlineData("assembly")]
+        [InlineData("rid")]
+        [InlineData("scd")]
+        public void BasicFieldMismatchInvalidatesTheHit(string change)
+        {
+            CreateOutput();
+            CiBuildRecord.Write(_root, Output, Inputs(), BuiltJob());
+            var current = Inputs() with
+            {
+                AssemblyName = change == "assembly" ? "Renamed" : "App",
+                Rid = change == "rid" ? "linux-arm64" : "win-x64",
+                SelfContained = change == "scd",
+            };
+            Assert.Null(Read(_root, Output, current));
+            Assert.NotNull(Read(_root, Output, Inputs()));
+        }
+
+        [Theory]
+        [InlineData("no-resolved-build")]
+        [InlineData("non-sha-commit")]
+        [InlineData("non-http-feed")]
+        [InlineData("version-mismatch")]
+        [InlineData("malformed-sdk")]
+        public void InconsistentSnapshotIsAMiss_NeverTrustsTheRecordBlindly(string change)
+        {
+            // Internal snapshot-shape validation only — never compares against a user-supplied or newly
+            // resolved value. A record that is internally inconsistent (not what CloneRestoreAndBuild
+            // could ever have actually written) must be a normal cache miss up front, rather than passing
+            // Read and only failing later during reinstall/validation.
+            CreateOutput();
+            var original = Inputs();
+            var stored = change switch
+            {
+                "no-resolved-build" => original with { RuntimeBuild = null, AspNetCoreBuild = null },
+                "non-sha-commit" => original with { RuntimeBuild = original.RuntimeBuild with { CommitSha = "not-a-sha" } },
+                "non-http-feed" => original with { RuntimeBuild = original.RuntimeBuild with { AzureFeed = "file:///not-http" } },
+                "version-mismatch" => original with { RuntimeBuild = original.RuntimeBuild with { Version = "99.0.0" } },
+                _ => original with { SdkVersion = "not-a-version" }
+            };
+            CiBuildRecord.Write(_root, Output, stored, BuiltJob());
+            Assert.Null(Read(_root, Output, original));
+        }
+
+        [Theory]
+        [InlineData("Selection.RuntimeVersion")]
+        [InlineData("Selection.AspNetCoreVersion")]
+        [InlineData("Selection.SdkVersion")]
+        [InlineData("Selection.RuntimeBuild.Version")]
+        [InlineData("Selection.RuntimeBuild.CommitSha")]
+        [InlineData("Selection.RuntimeBuild.AzureFeed")]
+        public void NullOrOmittedVersionIdentityFieldIsAMissNotAnException(string jsonPath)
+        {
+            // A null (explicit JSON null, or simply omitted) version/SDK/commit/feed field anywhere in
+            // the snapshot must be treated as a normal cache miss — never let a null escape IsConsistentSnapshot
+            // (or any other check) as an unhandled exception out of Read, which only catches IO/Json errors.
+            CreateOutput();
+            CiBuildRecord.Write(_root, Output, Inputs(), BuiltJob());
+            var path = Path.Combine(_root, CiBuildRecord.FileName);
+            var record = JObject.Parse(File.ReadAllText(path));
+            var segments = jsonPath.Split('.');
+            var target = record;
+            for (var i = 0; i < segments.Length - 1; i++)
+                target = (JObject)target[segments[i]];
+            target[segments[^1]] = JValue.CreateNull();
+            File.WriteAllText(path, record.ToString());
+
+            var exception = Record.Exception(() => Read(_root, Output, Inputs()));
+            Assert.Null(exception);
+            Assert.Null(Read(_root, Output, Inputs()));
+        }
+
+        [Theory]
         [InlineData("runtime-commit")]
         [InlineData("aspnet-commit")]
         [InlineData("runtime-version")]
@@ -102,33 +177,38 @@ namespace Microsoft.Crank.UnitTests
         [InlineData("compile-aspnet")]
         [InlineData("desktop")]
         [InlineData("tfm")]
-        [InlineData("rid")]
-        [InlineData("scd")]
-        [InlineData("assembly")]
-        public void ResolvedInputsInvalidateSameRequestedKey(string change)
+        public void ResolvedValueChangesDoNotInvalidateTheHit_RecordedMetadataIsFrozenNotCurrentLatest(string change)
         {
+            // A matching request/build-key guard is enough: the record is a completion proof, not a
+            // current-resolved-input equality mechanism, so none of these would ever be re-resolved on a
+            // hit in the first place. This demonstrates the frozen record is used as-is regardless.
             CreateOutput();
             var original = Inputs();
-            CiBuildRecord.Write(_root, Output, original, BuiltJob());
-            var changed = change switch
+            var stored = change switch
             {
                 "runtime-commit" => original with { RuntimeBuild = original.RuntimeBuild with { CommitSha = new string('b', 40) } },
                 "aspnet-commit" => original with { AspNetCoreBuild = original.AspNetCoreBuild with { CommitSha = new string('b', 40) } },
-                "runtime-version" => original with { RuntimeVersion = "12.0.1" },
-                "aspnet-version" => original with { AspNetCoreVersion = "12.0.1" },
+                "runtime-version" => original with { RuntimeVersion = "12.0.1", RuntimeBuild = original.RuntimeBuild with { Version = "12.0.1" } },
+                "aspnet-version" => original with { AspNetCoreVersion = "12.0.1", AspNetCoreBuild = original.AspNetCoreBuild with { Version = "12.0.1" } },
                 "runtime-source" => original with { RuntimeBuild = original.RuntimeBuild with { AzureFeed = "https://another.test/install" } },
                 "aspnet-source" => original with { AspNetCoreBuild = original.AspNetCoreBuild with { AzureFeed = "https://another.test/install" } },
                 "sdk" => original with { SdkVersion = "10.0.402" },
                 "compile-runtime" => original with { BuildRuntimeVersion = "10.0.13" },
                 "compile-aspnet" => original with { BuildAspNetCoreVersion = "10.0.13" },
                 "desktop" => original with { DesktopVersion = "10.0.13" },
-                "tfm" => original with { Framework = "net11.0" },
-                "rid" => original with { Rid = "linux-arm64" },
-                "scd" => original with { SelfContained = true },
-                _ => original with { AssemblyName = "Renamed" }
+                _ => original with { Framework = "net11.0" }
             };
-            Assert.Null(CiBuildRecord.Read(_root, Output, changed));
-            Assert.NotNull(CiBuildRecord.Read(_root, Output, original));
+            CiBuildRecord.Write(_root, Output, stored, BuiltJob());
+
+            var record = Read(_root, Output, original);
+            Assert.NotNull(record);
+            var job = new Job();
+            record.Restore(job);
+            // The restored job reflects whatever was recorded, not a freshly resolved/"current latest" value.
+            Assert.Equal(stored.RuntimeVersion, job.RuntimeVersion);
+            Assert.Equal(stored.RuntimeBuild.CommitSha, job.RuntimeCommitSha);
+            Assert.Equal(stored.SdkVersion, job.SdkVersion);
+            Assert.Equal(stored.Framework, job.BuildFramework);
         }
 
         [Theory]
@@ -144,7 +224,7 @@ namespace Microsoft.Crank.UnitTests
             CreateOutput();
             if (content != null)
                 File.WriteAllText(Path.Combine(_root, CiBuildRecord.FileName), content);
-            Assert.Null(CiBuildRecord.Read(_root, Output, Inputs()));
+            Assert.Null(Read(_root, Output, Inputs()));
         }
 
         [Theory]
@@ -157,7 +237,7 @@ namespace Microsoft.Crank.UnitTests
             CreateOutput(true);
             CiBuildRecord.Write(_root, Output, Inputs(true), BuiltJob());
             File.Delete(Path.Combine(Output, file));
-            Assert.Null(CiBuildRecord.Read(_root, Output, Inputs(true)));
+            Assert.Null(Read(_root, Output, Inputs(true)));
             CiBuildRecord.Invalidate(_root);
             CiBuildRecord.Write(_root, Output, Inputs(true), BuiltJob());
             Assert.False(File.Exists(Path.Combine(_root, CiBuildRecord.FileName)));
@@ -175,7 +255,44 @@ namespace Microsoft.Crank.UnitTests
             var record = JObject.Parse(File.ReadAllText(path));
             record[property] = new JArray(JValue.CreateNull());
             File.WriteAllText(path, record.ToString());
-            Assert.Null(CiBuildRecord.Read(_root, Output, Inputs()));
+            Assert.Null(Read(_root, Output, Inputs()));
+        }
+
+        [Fact]
+        public async Task FddHitCancellationPropagatesWithoutInstallingOrMutatingTheRecord()
+        {
+            // Cancellation must propagate like any other installer-alternative code path (never be
+            // swallowed into job.Error/null), and a canceled reinstall must leave no installed private
+            // home and no record mutation behind.
+            var rootField = typeof(Startup).GetField("_rootTempDir", BindingFlags.Static | BindingFlags.NonPublic);
+            var previousRoot = rootField.GetValue(null);
+            try
+            {
+                rootField.SetValue(null, _root);
+                CreateOutput();
+                CiBuildRecord.Write(_root, Output, Inputs(), BuiltJob());
+                var marker = File.ReadAllText(Path.Combine(_root, CiBuildRecord.FileName));
+                Directory.CreateDirectory(Path.Combine(_root, "_options"));
+
+                var job = new Job
+                {
+                    BuildKey = "cancel-key", Project = "App.csproj", RuntimeVersion = Sha, AspNetCoreVersion = Sha,
+                    SdkVersion = "10.0.401", DesktopVersion = "10.0.12", SelfContained = false, NoBuild = true, NoClean = true
+                };
+                File.WriteAllText(Path.Combine(_root, "_options", "cancel-key.json"), JsonConvert.SerializeObject(job.GetBuildKeyData()));
+                var context = new JobContext();
+                var clone = typeof(Startup).GetMethod("CloneRestoreAndBuild", BindingFlags.Static | BindingFlags.NonPublic);
+
+                using var cts = new CancellationTokenSource();
+                cts.Cancel();
+                var build = (Task<string>)clone.Invoke(null, new object[] { _root, job, @"C:\unused-sdk", context, cts.Token });
+                await Assert.ThrowsAsync<OperationCanceledException>(async () => await build);
+
+                Assert.Null(context.BuildCacheDotnetHome);
+                Assert.Empty(Directory.GetDirectories(_root, "ci-dotnet-*"));
+                Assert.Equal(marker, File.ReadAllText(Path.Combine(_root, CiBuildRecord.FileName)));
+            }
+            finally { rootField.SetValue(null, previousRoot); }
         }
 
         [Fact]
@@ -200,201 +317,329 @@ namespace Microsoft.Crank.UnitTests
         }
 
         [Fact]
-        public void SharedKeyDefersWithoutBlockingOwnerReleaseEvenWithNoClean()
+        public void NoSharedBuildOwnershipMechanismRemains()
         {
-            var first = new JobContext { Job = new Job { NoClean = true }, BuildAndRunTask = Task.CompletedTask };
-            var next = new JobContext { Job = new Job() };
-            Assert.True(Startup.TryAcquireBuildPath(first, _root));
-            Assert.False(Startup.TryAcquireBuildPath(next, _root + Path.DirectorySeparatorChar));
-            try
-            {
-                Assert.True(Startup.TryAcquireBuildPath(first, _root));
-                var attempt = Task.Run(() => Startup.TryAcquireBuildPath(next, Path.Combine(_root, ".")));
-                Assert.True(attempt.Wait(TimeSpan.FromSeconds(2)));
-                Assert.False(attempt.Result);
-                using var current = Process.GetCurrentProcess();
-                first.Job.ChildProcessId = current.Id;
-                Assert.False(Startup.ReleaseBuildPath(first, first.Job, stopped: true));
-                first.Job.ChildProcessId = 0;
-                first.BuildAndRunTask = new TaskCompletionSource().Task;
-                Assert.False(Startup.ReleaseBuildPath(first, first.Job, stopped: true));
-                first.BuildAndRunTask = Task.CompletedTask;
-                Assert.False(Startup.ReleaseBuildPath(first, first.Job, stopped: false));
-                Assert.True(Startup.ReleaseBuildPath(first, first.Job, stopped: true));
-                Assert.True(Startup.TryAcquireBuildPath(next, _root));
-            }
-            finally
-            {
-                first.Job.ChildProcessId = 0;
-                first.BuildAndRunTask = Task.CompletedTask;
-                Startup.ReleaseBuildPath(first, first.Job, true);
-                Startup.ReleaseBuildPath(next, next.Job, true);
-            }
+            // The whole-job-lifetime reservation (_buildOwners/TryAcquireBuildPath/ReleaseBuildPath/
+            // OwnedBuildPath) caused a same-run two-service deadlock, a Docker Stop->Delete permanent
+            // key poison, and a late-canceled-task permanent key poison. It has been removed entirely;
+            // matching requests share cached output read-only exactly like the pre-existing non-CI
+            // BuildKey/_options guard always has, with no new coordination primitive.
+            Assert.Null(typeof(Startup).GetMethod("TryAcquireBuildPath", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic));
+            Assert.Null(typeof(Startup).GetMethod("ReleaseBuildPath", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic));
+            Assert.Null(typeof(Startup).GetField("_buildOwners", BindingFlags.Static | BindingFlags.NonPublic));
+            Assert.Null(typeof(JobContext).GetProperty("OwnedBuildPath", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic));
+            // CanDeleteBuildCacheHome remains: it is still used independently for the job's own private
+            // CI runtime-home cleanup in DeleteJobAsync, unrelated to any cross-job coordination.
+            Assert.NotNull(typeof(Startup).GetMethod("CanDeleteBuildCacheHome", BindingFlags.Static | BindingFlags.NonPublic));
         }
 
         [Fact]
-        public void FailedContainerCleanupCannotReleaseSharedBuildPath()
+        public async Task SharedBuildKeyTwoJobsReuseImmediatelyWithoutDeferring()
         {
-            var job = new Job { DockerFile = "Dockerfile", State = JobState.Failed };
-            var context = new JobContext { Job = job, BuildAndRunTask = Task.CompletedTask };
-            Assert.True(Startup.TryAcquireBuildPath(context, _root));
-            try { Assert.False(Startup.ReleaseBuildPath(context, job, stopped: true)); }
-            finally
-            {
-                job.State = JobState.Stopped;
-                Assert.True(Startup.ReleaseBuildPath(context, job, stopped: true));
-            }
-        }
-
-        [Theory]
-        [InlineData(false)]
-        [InlineData(true)]
-        public void CompletedFailedBuildReleasesKeyForNextJob(bool canceled)
-        {
-            var first = new JobContext
-            {
-                Job = new Job { State = JobState.Failed },
-                BuildAndRunTask = canceled ? Task.FromCanceled(new CancellationToken(true)) : Task.FromException(new HttpRequestException("resolver failed"))
-            };
-            var next = new JobContext { Job = new Job() };
-            Assert.True(Startup.TryAcquireBuildPath(first, _root));
+            // Two services intentionally sharing a BuildKey (identical requested options, different
+            // Service/Arguments, which are not part of the key) must both be able to proceed immediately:
+            // the second never defers waiting on the first, matching the pre-existing non-CI behavior.
+            var field = typeof(Startup).GetField("_rootTempDir", BindingFlags.Static | BindingFlags.NonPublic);
+            var previous = field.GetValue(null);
             try
             {
-                Assert.False(Startup.ReleaseBuildPath(first, first.Job, stopped: false));
-                using var process = Process.GetCurrentProcess();
-                first.Job.ChildProcessId = process.Id;
-                Assert.False(Startup.ReleaseBuildPath(first, first.Job, stopped: true));
-                Assert.False(Startup.TryAcquireBuildPath(next, _root));
-                first.Job.ChildProcessId = 0;
-                Assert.True(Startup.ReleaseBuildPath(first, first.Job, stopped: true));
-                Assert.True(Startup.TryAcquireBuildPath(next, _root));
+                field.SetValue(null, _root);
+                var retrieve = typeof(Startup).GetMethod("RetrieveSourcesAsync", BindingFlags.Static | BindingFlags.NonPublic);
+
+                var first = new Job { BuildKey = "shared-key", Project = "App.csproj" };
+                var second = new Job { BuildKey = "shared-key", Project = "App.csproj" };
+
+                var firstReuse = await (Task<bool>)retrieve.Invoke(null, new object[] { first, _root });
+                Assert.False(firstReuse); // first use: nothing cached yet
+
+                var secondTask = (Task<bool>)retrieve.Invoke(null, new object[] { second, _root });
+                Assert.True(secondTask.Wait(TimeSpan.FromSeconds(2)), "second job must not block waiting on the first");
+                Assert.True(await secondTask); // options already matched: read-only reuse, no write race
             }
-            finally
-            {
-                first.Job.ChildProcessId = 0;
-                Startup.ReleaseBuildPath(first, first.Job, true);
-                Startup.ReleaseBuildPath(next, next.Job, true);
-            }
+            finally { field.SetValue(null, previous); }
         }
 
-        [Theory]
-        [InlineData(false)]
-        [InlineData(true)]
-        public async Task SelfContainedHitOnlyResolvesAndNeverInstallsOrBuilds(bool resolutionFails)
+        [Fact]
+        public async Task ConcurrentMatchingReadersBothHitWithoutBlockingOrMutatingEachOther()
         {
-            using var portReservation = new TcpListener(IPAddress.Loopback, 0);
-            portReservation.Start();
-            var url = $"http://127.0.0.1:{((IPEndPoint)portReservation.LocalEndpoint).Port}";
-            portReservation.Stop();
-            using var listener = new HttpListener();
-            listener.Prefixes.Add(url + "/");
-            listener.Start();
-            var requests = 0;
-            var unavailable = resolutionFails;
-            var serving = Task.Run(async () =>
+            var rootField = typeof(Startup).GetField("_rootTempDir", BindingFlags.Static | BindingFlags.NonPublic);
+            var previousRoot = rootField.GetValue(null);
+            try
+            {
+                rootField.SetValue(null, _root);
+                CreateOutput(true);
+                CiBuildRecord.Write(_root, Output, Inputs(true), BuiltJob());
+                var marker = File.ReadAllText(Path.Combine(_root, CiBuildRecord.FileName));
+                Directory.CreateDirectory(Path.Combine(_root, "_options"));
+
+                var flags = BindingFlags.Static | BindingFlags.NonPublic;
+                var clone = typeof(Startup).GetMethod("CloneRestoreAndBuild", flags);
+
+                Job NewReader(string key)
+                {
+                    var job = new Job
+                    {
+                        BuildKey = key, Project = "App.csproj", RuntimeVersion = Sha, AspNetCoreVersion = Sha,
+                        SdkVersion = "10.0.401", DesktopVersion = "10.0.12", SelfContained = true, NoBuild = true, NoClean = true
+                    };
+                    File.WriteAllText(Path.Combine(_root, "_options", $"{key}.json"), JsonConvert.SerializeObject(job.GetBuildKeyData()));
+                    return job;
+                }
+
+                var firstJob = NewReader("concurrent-key");
+                var secondJob = NewReader("concurrent-key");
+                var firstContext = new JobContext();
+                var secondContext = new JobContext();
+
+                var firstTask = (Task<string>)clone.Invoke(null, new object[] { _root, firstJob, @"C:\unused-sdk", firstContext, CancellationToken.None });
+                var secondTask = (Task<string>)clone.Invoke(null, new object[] { _root, secondJob, @"C:\unused-sdk", secondContext, CancellationToken.None });
+
+                await Task.WhenAll(firstTask, secondTask);
+
+                Assert.Equal(_root, await firstTask);
+                Assert.Equal(_root, await secondTask);
+                Assert.Equal(Sha, firstJob.RuntimeCommitSha);
+                Assert.Equal(Sha, secondJob.RuntimeCommitSha);
+                Assert.Null(firstJob.Error);
+                Assert.Null(secondJob.Error);
+                // Neither reader installed or mutated anything: the record is untouched.
+                Assert.Equal(marker, File.ReadAllText(Path.Combine(_root, CiBuildRecord.FileName)));
+            }
+            finally { rootField.SetValue(null, previousRoot); }
+        }
+
+        /// <summary>
+        /// Hermetic, real-CloneRestoreAndBuild hit tests. A stub `dotnet-install.ps1` is used in place of
+        /// the real script so no network archive download happens, while still exercising the actual
+        /// production install call (exact recorded version/feed/home), and the actual BCS base URL is
+        /// pointed at a listener that fails everything except latestBuilds.json (serving an "advanced"
+        /// SHA) to prove a hit never requests it.
+        /// </summary>
+        [Fact]
+        public async Task FddHitInstallsFrozenRecordedVersionsWithoutAnyBcsLatestLookup()
+        {
+            var advancedSha = new string('9', 40);
+            using var fixture = new HitFixture(_root, advancedSha);
+            try
+            {
+                await fixture.ArrangeAsync();
+                var job = fixture.NewHitJob(selfContained: false);
+                var context = new JobContext();
+                var clone = typeof(Startup).GetMethod("CloneRestoreAndBuild", BindingFlags.Static | BindingFlags.NonPublic);
+                var result = await (Task<string>)clone.Invoke(null, new object[] { _root, job, @"C:\unused-sdk", context, CancellationToken.None });
+
+                Assert.Equal(_root, result);
+                Assert.True(string.IsNullOrEmpty(job.Error));
+                Assert.Equal(Sha, job.RuntimeCommitSha);
+                Assert.Equal(Sha, job.AspNetCoreCommitSha);
+                Assert.NotNull(context.BuildCacheDotnetHome);
+                Assert.True(File.Exists(Path.Combine(context.BuildCacheDotnetHome, "shared", "Microsoft.NETCore.App", "12.0.0-dev", ".version")));
+                Assert.True(File.Exists(Path.Combine(context.BuildCacheDotnetHome, "shared", "Microsoft.AspNetCore.App", "12.0.0-dev", ".version")));
+                fixture.AssertInstalledExactRecordedVersionsOnly();
+                fixture.AssertNoBcsLatestOrVersionMarkerRequestsMade();
+            }
+            finally { fixture.Dispose(); }
+        }
+
+        [Fact]
+        public async Task ScdHitNeverInstallsOrTouchesNetworkEvenWhenBcsIsUnavailable()
+        {
+            using var fixture = new HitFixture(_root, new string('9', 40), bcsAlwaysFails: true);
+            try
+            {
+                await fixture.ArrangeAsync(selfContained: true);
+                var job = fixture.NewHitJob(selfContained: true);
+                var context = new JobContext();
+                var clone = typeof(Startup).GetMethod("CloneRestoreAndBuild", BindingFlags.Static | BindingFlags.NonPublic);
+                var result = await (Task<string>)clone.Invoke(null, new object[] { _root, job, @"C:\unused-sdk", context, CancellationToken.None });
+
+                Assert.Equal(_root, result);
+                Assert.True(string.IsNullOrEmpty(job.Error));
+                Assert.Equal(Sha, job.RuntimeCommitSha);
+                Assert.Null(context.BuildCacheDotnetHome);
+                Assert.Equal(0, fixture.InstallInvocationCount);
+                fixture.AssertNoBcsLatestOrVersionMarkerRequestsMade();
+            }
+            finally { fixture.Dispose(); }
+        }
+
+        /// <summary>
+        /// Arranges a fully hermetic environment for a real CloneRestoreAndBuild hit: a stub
+        /// dotnet-install.ps1 standing in for the real installer (recording its exact invocation and
+        /// materializing the expected .version/deps.json/runtimeconfig.json so ValidateInstallation
+        /// passes), and a local HTTP listener standing in for BCS that fails any latestBuilds.json /
+        /// latest.version request (or always 500s, for the SCD "unavailable" case).
+        /// </summary>
+        private sealed class HitFixture : IDisposable
+        {
+            private readonly string _root;
+            private readonly string _installPath;
+            private readonly HttpListener _listener;
+            private readonly Dictionary<FieldInfo, object> _savedFields = new();
+            private readonly string _advancedSha;
+            private readonly bool _bcsAlwaysFails;
+            private Task _serving;
+            private int _requests;
+
+            public int InstallInvocationCount =>
+                File.Exists(Path.Combine(_installPath, "install-log.txt"))
+                    ? File.ReadAllLines(Path.Combine(_installPath, "install-log.txt")).Length
+                    : 0;
+
+            public HitFixture(string root, string advancedSha, bool bcsAlwaysFails = false)
+            {
+                _root = root;
+                _advancedSha = advancedSha;
+                _bcsAlwaysFails = bcsAlwaysFails;
+                _installPath = Directory.CreateTempSubdirectory("crank-ci-install-").FullName;
+
+                using var reservation = new TcpListener(IPAddress.Loopback, 0);
+                reservation.Start();
+                var port = ((IPEndPoint)reservation.LocalEndpoint).Port;
+                reservation.Stop();
+                BaseUrl = $"http://127.0.0.1:{port}";
+                _listener = new HttpListener();
+                _listener.Prefixes.Add(BaseUrl + "/");
+            }
+
+            public string BaseUrl { get; }
+
+            public async Task ArrangeAsync(bool selfContained = false)
+            {
+                var flags = BindingFlags.Static | BindingFlags.NonPublic;
+                Save(typeof(Startup).GetField("_rootTempDir", flags), _root);
+                Save(typeof(Startup).GetField("_buildCacheBaseUrl", flags), BaseUrl);
+                Save(typeof(Startup).GetField("_dotnetInstallPath", flags), _installPath);
+                Save(typeof(Startup).GetField("_pwsh", flags), "pwsh");
+                Save(typeof(Startup).GetProperty("Logger", flags), new Serilog.LoggerConfiguration().CreateLogger());
+
+                Directory.CreateDirectory(Path.Combine(_root, "published"));
+                foreach (var file in new[] { "App.dll", "App.deps.json", "App.runtimeconfig.json" })
+                    File.WriteAllText(Path.Combine(_root, "published", file), "published fixture");
+                if (selfContained)
+                    File.WriteAllText(Path.Combine(_root, "published", "App.exe"), "apphost fixture");
+
+                // Matches the existing request guard: the _options/<BuildKey>.json file must already
+                // reflect the exact same requested build-key data as the job about to request a hit.
+                Directory.CreateDirectory(Path.Combine(_root, "_options"));
+                File.WriteAllText(Path.Combine(_root, "_options", "ci-hit-fixture.json"),
+                    JsonConvert.SerializeObject(NewHitJob(selfContained).GetBuildKeyData()));
+
+                WriteInstallerStub();
+
+                var selection = new CiBuildRecord.Inputs(
+                    new(Sha, "12.0.0-dev", $"{BaseUrl}/builds/runtime/buildArtifacts/{Sha}/{BuildCacheClient.GetConfiguration("runtime", "win-x64")}/install"),
+                    new(Sha, "12.0.0-dev", $"{BaseUrl}/builds/aspnetcore/buildArtifacts/{Sha}/{BuildCacheClient.GetConfiguration("aspnetcore", "win-x64")}/install"),
+                    "12.0.0-dev", "12.0.0-dev", "10.0.401", "net10.0", "win-x64", selfContained,
+                    "10.0.12", "10.0.12", "10.0.12", "App");
+
+                var job = BuiltJob(Sha);
+                CiBuildRecord.Write(_root, Path.Combine(_root, "published"), selection, job);
+
+                _listener.Start();
+                _serving = ServeAsync();
+            }
+
+            public Job NewHitJob(bool selfContained) => new()
+            {
+                BuildKey = "ci-hit-fixture", Project = "App.csproj", RuntimeVersion = Sha, AspNetCoreVersion = Sha,
+                SdkVersion = "10.0.401", DesktopVersion = "10.0.12", SelfContained = selfContained, NoBuild = true, NoClean = true
+            };
+
+            public void AssertNoBcsLatestOrVersionMarkerRequestsMade() =>
+                Assert.DoesNotContain(_requestPaths, p => p.Contains("latestBuilds.json") || p.EndsWith("/main/latest.version"));
+
+            public void AssertInstalledExactRecordedVersionsOnly()
+            {
+                Assert.Equal(2, InstallInvocationCount);
+                var log = File.ReadAllLines(Path.Combine(_installPath, "install-log.txt"));
+                Assert.Contains(log, l => l.StartsWith("dotnet|12.0.0-dev|"));
+                Assert.Contains(log, l => l.StartsWith("aspnetcore|12.0.0-dev|"));
+                // The feed used for install came straight from the recorded AzureFeed; it embeds the full
+                // commit SHA, proving the exact frozen build (not a re-resolved one) was installed.
+                Assert.Contains(log, l => l.Contains(Sha));
+            }
+
+            private readonly List<string> _requestPaths = new();
+
+            private async Task ServeAsync()
             {
                 try
                 {
-                    while (listener.IsListening)
+                    while (_listener.IsListening)
                     {
-                        var request = await listener.GetContextAsync();
-                        Interlocked.Increment(ref requests);
-                        if (Volatile.Read(ref unavailable) || !request.Request.Url.AbsolutePath.EndsWith("/main/latest.version"))
-                            request.Response.StatusCode = 404;
+                        var context = await _listener.GetContextAsync();
+                        lock (_requestPaths) { _requestPaths.Add(context.Request.Url.AbsolutePath); }
+                        Interlocked.Increment(ref _requests);
+                        if (_bcsAlwaysFails || !context.Request.Url.AbsolutePath.EndsWith("/latestBuilds.json"))
+                        {
+                            context.Response.StatusCode = 404;
+                        }
                         else
                         {
-                            var content = Encoding.UTF8.GetBytes($"{Sha}\n12.0.0-dev\n");
-                            request.Response.ContentLength64 = content.Length;
-                            await request.Response.OutputStream.WriteAsync(content);
+                            // A hit must never even request this, but if it did, it would see an "advanced"
+                            // (different) commit — proving the hit still freezes on the recorded SHA.
+                            var payload = System.Text.Encoding.UTF8.GetBytes(
+                                "{\"all\":{\"CommitSha\":\"" + _advancedSha + "\"}}");
+                            context.Response.ContentLength64 = payload.Length;
+                            await context.Response.OutputStream.WriteAsync(payload);
                         }
-                        request.Response.Close();
+                        context.Response.Close();
                     }
                 }
                 catch (Exception ex) when (ex is HttpListenerException or ObjectDisposedException) { }
-            });
-
-            const BindingFlags flags = BindingFlags.Static | BindingFlags.NonPublic;
-            var fields = new[] { "_rootTempDir", "_buildCacheBaseUrl", "_pwsh", "_fileContentCache" }
-                .Select(name => typeof(Startup).GetField(name, flags)).ToDictionary(field => field, field => field.GetValue(null));
-            var logger = typeof(Startup).GetProperty("Logger", flags);
-            var previousLogger = logger.GetValue(null);
-            var sdks = (System.Collections.Generic.HashSet<string>)typeof(Startup).GetField("_installedSdks", flags).GetValue(null);
-            var addedSdk = sdks.Add("10.0.401");
-            using var cache = new MemoryCache(new MemoryCacheOptions());
-            using var testLogger = new Serilog.LoggerConfiguration().CreateLogger();
-            JobContext owner = null;
-            try
-            {
-                typeof(Startup).GetField("_rootTempDir", flags).SetValue(null, _root);
-                typeof(Startup).GetField("_buildCacheBaseUrl", flags).SetValue(null, url);
-                typeof(Startup).GetField("_pwsh", flags).SetValue(null, "installer-must-not-run");
-                typeof(Startup).GetField("_fileContentCache", flags).SetValue(null, cache);
-                logger.SetValue(null, testLogger);
-                cache.Set(("https://builds.dotnet.microsoft.com/dotnet/release-metadata/10.0/releases.json", (TimeSpan?)TimeSpan.FromDays(1)),
-                    """{"releases":[{"runtime":{"version":"10.0.12"},"aspnetcore-runtime":{"version":"10.0.12"},"windowsdesktop":{"version":"10.0.12"},"sdk":{"version":"10.0.401"}}]}""");
-                var rid = (string)typeof(Startup).GetMethod("GetPlatformMoniker", flags).Invoke(null, null);
-                var selection = Inputs(true) with
-                {
-                    Rid = rid,
-                    RuntimeBuild = new(Sha, "12.0.0-dev", $"{url}/builds/runtime/buildArtifacts/{Sha}/{BuildCacheClient.GetConfiguration("runtime", rid)}/install"),
-                    AspNetCoreBuild = new(Sha, "12.0.0-dev", $"{url}/builds/aspnetcore/buildArtifacts/{Sha}/{BuildCacheClient.GetConfiguration("aspnetcore", rid)}/install")
-                };
-                CreateOutput(true);
-                File.WriteAllText(Path.Combine(Output, "App"), "Unix apphost fixture");
-                CiBuildRecord.Write(_root, Output, selection, BuiltJob());
-                var marker = File.ReadAllText(Path.Combine(_root, CiBuildRecord.FileName));
-                Job NewJob() => new Job { BuildKey = "reuse", Project = "App.csproj", Framework = "net10.0", SdkVersion = "10.0.401",
-                    DesktopVersion = "10.0.12", RuntimeVersion = Sha, AspNetCoreVersion = Sha, SelfContained = true, NoBuild = true, NoClean = true };
-                var job = NewJob();
-                Directory.CreateDirectory(Path.Combine(_root, "_options"));
-                File.WriteAllText(Path.Combine(_root, "_options", "reuse.json"), JsonConvert.SerializeObject(job.GetBuildKeyData()));
-                var context = owner = new JobContext { Job = job };
-                Assert.True(Startup.TryAcquireBuildPath(context, _root));
-                var build = (Task<string>)typeof(Startup).GetMethod("CloneRestoreAndBuild", flags).Invoke(null,
-                    new object[] { _root, job, Path.Combine(_root, "SDK-does-not-exist"), context, CancellationToken.None });
-                context.BuildAndRunTask = build;
-                if (resolutionFails)
-                {
-                    await Assert.ThrowsAsync<HttpRequestException>(async () => await build);
-                    Assert.True(Startup.ReleaseBuildPath(context, job, stopped: true));
-                    Volatile.Write(ref unavailable, false);
-                    var retry = NewJob();
-                    owner = new JobContext { Job = retry };
-                    Assert.True(Startup.TryAcquireBuildPath(owner, _root));
-                    var retryBuild = (Task<string>)typeof(Startup).GetMethod("CloneRestoreAndBuild", flags).Invoke(null,
-                        new object[] { _root, retry, Path.Combine(_root, "SDK-does-not-exist"), owner, CancellationToken.None });
-                    owner.BuildAndRunTask = retryBuild;
-                    Assert.Equal(_root, await retryBuild);
-                    Assert.Equal(Sha, retry.RuntimeCommitSha);
-                    Assert.Equal(3, requests);
-                    Assert.Null(owner.BuildCacheDotnetHome);
-                    Assert.True(Startup.ReleaseBuildPath(owner, retry, stopped: true));
-                }
-                else
-                {
-                    Assert.Equal(_root, await build);
-                    Assert.Equal(2, requests);
-                    Assert.Null(context.BuildCacheDotnetHome);
-                    Assert.Equal("", job.BuildLog.ToString());
-                    Assert.Equal(Sha, job.RuntimeCommitSha);
-                    Assert.Equal(Sha, Assert.Single(job.Dependencies).CommitHash);
-                    Assert.Equal("10.0.401", job.SdkVersion);
-                    Assert.Equal(TimeSpan.Zero, job.BuildTime);
-                    Assert.False(Directory.Exists(Path.Combine(_root, "SDK-does-not-exist")));
-                }
-                Assert.Equal(marker, File.ReadAllText(Path.Combine(_root, CiBuildRecord.FileName)));
             }
-            finally
+
+            private void WriteInstallerStub()
             {
-                if (owner != null)
-                    Startup.ReleaseBuildPath(owner, owner.Job, true);
-                foreach (var (field, value) in fields)
+                // Stands in for the real dotnet-install.ps1: records its exact invocation and materializes
+                // only what ValidateInstallation actually checks, without any network access.
+                File.WriteAllText(Path.Combine(_installPath, "dotnet-install.ps1"), """
+                param(
+                    [string]$Version,
+                    [string]$Runtime,
+                    [string]$Architecture,
+                    [switch]$NoPath,
+                    [switch]$SkipNonVersionedFiles,
+                    [string]$InstallDir,
+                    [string]$AzureFeed
+                )
+                Add-Content -Path (Join-Path $PSScriptRoot 'install-log.txt') -Value "$Runtime|$Version|$AzureFeed"
+                $framework = if ($Runtime -eq 'aspnetcore') { 'Microsoft.AspNetCore.App' } else { 'Microsoft.NETCore.App' }
+                $dir = Join-Path $InstallDir "shared\$framework\$Version"
+                New-Item -ItemType Directory -Force -Path $dir | Out-Null
+                if ($AzureFeed -match '([0-9a-f]{40})') { $sha = $Matches[1] } else { $sha = 'unknown' }
+                Set-Content -Path (Join-Path $dir '.version') -Value "$sha`n$Version"
+                Set-Content -Path (Join-Path $dir "$framework.deps.json") -Value '{}'
+                Set-Content -Path (Join-Path $dir "$framework.runtimeconfig.json") -Value '{}'
+                if ($Runtime -eq 'dotnet') { Set-Content -Path (Join-Path $InstallDir 'dotnet.exe') -Value 'stub' }
+                """);
+            }
+
+            private void Save(FieldInfo field, object value)
+            {
+                _savedFields[field] = field.GetValue(null);
+                field.SetValue(null, value);
+            }
+
+            private void Save(PropertyInfo property, object value)
+            {
+                // PropertyInfo isn't a FieldInfo; stash via a thin adapter key using its backing setter.
+                _propertySaves.Add((property, property.GetValue(null)));
+                property.SetValue(null, value);
+            }
+
+            private readonly List<(PropertyInfo Property, object Value)> _propertySaves = new();
+
+            public void Dispose()
+            {
+                try { _listener?.Stop(); } catch { }
+                try { _serving?.Wait(TimeSpan.FromSeconds(2)); } catch { }
+                foreach (var (field, value) in _savedFields)
                     field.SetValue(null, value);
-                logger.SetValue(null, previousLogger);
-                if (addedSdk)
-                    sdks.Remove("10.0.401");
-                listener.Stop();
-                await serving;
+                foreach (var (property, value) in _propertySaves)
+                    property.SetValue(null, value);
+                try { Directory.Delete(_installPath, recursive: true); } catch { }
             }
         }
 

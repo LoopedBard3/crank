@@ -42,8 +42,8 @@ namespace Microsoft.Crank.Agent
             }
         }
 
-        private static bool IsVersion(string value) =>
-            Regex.IsMatch(value, @"\A\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?\z") && NuGetVersion.TryParse(value, out _);
+        internal static bool IsVersion(string value) =>
+            value != null && Regex.IsMatch(value, @"\A\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?\z") && NuGetVersion.TryParse(value, out _);
 
         internal static string GetConfiguration(string repo, string rid)
         {
