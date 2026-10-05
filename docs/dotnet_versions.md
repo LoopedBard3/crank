@@ -255,4 +255,3 @@ The agent supports these command-line options for BCS:
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--build-cache-base-url` | `https://pvscmdupload.z22.web.core.windows.net` | Base URL for BCS blob storage. |
-| `--build-cache-disabled` | (not set) | Disables BCS integration on this agent. |

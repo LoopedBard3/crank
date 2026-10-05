@@ -111,7 +111,6 @@ namespace Microsoft.Crank.Agent
 
         // Build Cache Service configuration
         private static string _buildCacheBaseUrl = "https://pvscmdupload.z22.web.core.windows.net";
-        private static bool _buildCacheEnabled = true;
 
         // Cached lists of SDKs and runtimes already installed
         private static readonly HashSet<string> _installedAspNetRuntimes = new(StringComparer.OrdinalIgnoreCase);
@@ -275,7 +274,6 @@ namespace Microsoft.Crank.Agent
             _managedIdentityClientId = app.Option("--mi-client-id", "Client ID of the user-assigned managed identity to use for authentication.", CommandOptionType.SingleValue);
 
             var buildCacheBaseUrlOption = app.Option("--build-cache-base-url", $"Base URL for Build Cache Service blob storage. Default is '{_buildCacheBaseUrl}'.", CommandOptionType.SingleValue);
-            var buildCacheDisabledOption = app.Option("--build-cache-disabled", "Disable Build Cache Service integration.", CommandOptionType.NoValue);
 
             app.OnExecute(() =>
             {
@@ -288,11 +286,6 @@ namespace Microsoft.Crank.Agent
                 if (buildCacheBaseUrlOption.HasValue())
                 {
                     _buildCacheBaseUrl = buildCacheBaseUrlOption.Value();
-                }
-
-                if (buildCacheDisabledOption.HasValue())
-                {
-                    _buildCacheEnabled = false;
                 }
 
                 if (_runAsService.HasValue() && OperatingSystem != OperatingSystem.Windows)
@@ -2890,11 +2883,6 @@ namespace Microsoft.Crank.Agent
             }
             if (useBuildCache)
             {
-                if (!_buildCacheEnabled)
-                {
-                    job.Error = "CI runtimes were requested but BCS is disabled (--build-cache-disabled).";
-                    return null;
-                }
                 if (jobContext == null)
                 {
                     throw new InvalidOperationException("CI installation requires a job-owned runtime home.");

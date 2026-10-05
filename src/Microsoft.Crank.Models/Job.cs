@@ -406,7 +406,7 @@ namespace Microsoft.Crank.Models
                 DockerPull = DockerPull,
                 DockerFile = DockerFile,
                 DockerImageName = DockerImageName,
-                DockerContextDirectory = DockerContextDirectory,
+                DockerContextDirectory = DockerContextDirectory
             };
         }
 
